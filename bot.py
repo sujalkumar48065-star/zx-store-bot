@@ -1514,51 +1514,6 @@ async def remove_coins(user_id: int, amount: int, tx_type: str, description: str
 
 
 
-async def get_premium(user_id: int):
-    async with db_conn() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM premium WHERE user_id=?", (user_id,))
-        return await cur.fetchone()
-
-
-async def is_premium_active(user_id: int) -> bool:
-    row = await get_premium(user_id)
-    if not row:
-        return False
-    if row["is_lifetime"]:
-        return True
-    if row["expiry_date"] and datetime.fromisoformat(row["expiry_date"]) > datetime.utcnow():
-        return True
-    return False
-
-
-async def grant_premium(user_id: int, days: int | None, admin_id: int) -> None:
-    async with db_conn() as db:
-        if days is None:
-            await db.execute(
-                "INSERT INTO premium (user_id, expiry_date, is_lifetime, granted_by, granted_at) "
-                "VALUES (?, NULL, 1, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
-                "expiry_date=NULL, is_lifetime=1, granted_by=excluded.granted_by, granted_at=excluded.granted_at",
-                (user_id, admin_id, datetime.utcnow().isoformat()),
-            )
-        else:
-            expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
-            await db.execute(
-                "INSERT INTO premium (user_id, expiry_date, is_lifetime, granted_by, granted_at) "
-                "VALUES (?, ?, 0, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
-                "expiry_date=excluded.expiry_date, is_lifetime=0, granted_by=excluded.granted_by, granted_at=excluded.granted_at",
-                (user_id, expiry, admin_id, datetime.utcnow().isoformat()),
-            )
-        await db.commit()
-
-
-async def remove_premium(user_id: int) -> None:
-    async with db_conn() as db:
-        await db.execute("DELETE FROM premium WHERE user_id=?", (user_id,))
-        await db.commit()
-
-
-
 def user_reply_keyboard(admin: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("Buy", style="success")],
@@ -1586,14 +1541,20 @@ def admin_reply_keyboard(is_owner: bool = True) -> ReplyKeyboardMarkup:
     ]
     if is_owner:
         buttons += ["📡 Force Channels"]
-    buttons += ["📢 Broadcast", "👥 User Manager", "👤 All Users", "👑 Premium Manager", "📊 Statistics", "🛠 Maintenance"]
+    buttons += ["📢 Broadcast", "👥 User Manager", "👤 All Users", "📊 Statistics", "🛠 Maintenance"]
     if is_owner:
         buttons += ["⚙ Settings"]
     buttons += [admin_mgr_label]
 
+    button_styles = {
+        "📤 Upload File": "success",
+        "📢 Broadcast": "danger",
+        "🛠 Maintenance": "danger",
+    }
     rows = [
-        [KeyboardButton(buttons[i], style="primary")] + (
-            [KeyboardButton(buttons[i + 1], style="primary")] if i + 1 < len(buttons) else []
+        [KeyboardButton(buttons[i], style=button_styles.get(buttons[i], "primary"))] + (
+            [KeyboardButton(buttons[i + 1], style=button_styles.get(buttons[i + 1], "primary"))]
+            if i + 1 < len(buttons) else []
         )
         for i in range(0, len(buttons), 2)
     ]
@@ -1605,19 +1566,18 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📤 Upload File", callback_data="ad:upload", style="success"),
          InlineKeyboardButton("📂 Manage Files", callback_data="ad:managefiles", style="primary")],
-        [InlineKeyboardButton("🛒 Product Manager", callback_data="ad:products", style="success"),
-         InlineKeyboardButton("💹 Economy Manager", callback_data="ad:economy", style="success")],
-        [InlineKeyboardButton("🚀 Referral Manager", callback_data="ad:referrals", style="success"),
-         InlineKeyboardButton("💰 Wallet Manager", callback_data="ad:walletmgr", style="success")],
-        [InlineKeyboardButton("🎟 Redeem Manager", callback_data="ad:redeemmgr", style="success"),
+        [InlineKeyboardButton("🛒 Product Manager", callback_data="ad:products", style="primary"),
+         InlineKeyboardButton("💹 Economy Manager", callback_data="ad:economy", style="primary")],
+        [InlineKeyboardButton("🚀 Referral Manager", callback_data="ad:referrals", style="primary"),
+         InlineKeyboardButton("💰 Wallet Manager", callback_data="ad:walletmgr", style="primary")],
+        [InlineKeyboardButton("🎟 Redeem Manager", callback_data="ad:redeemmgr", style="primary"),
          InlineKeyboardButton("📡 Force Channels", callback_data="ad:fcmgr", style="primary")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="ad:broadcast", style="danger"),
          InlineKeyboardButton("👥 User Manager", callback_data="ad:usermgr", style="primary")],
-        [InlineKeyboardButton("👑 Premium Manager", callback_data="ad:premiummgr", style="success"),
-         InlineKeyboardButton("📊 Statistics", callback_data="ad:stats", style="primary")],
-        [InlineKeyboardButton("🛠 Maintenance", callback_data="ad:maintenance", style="danger"),
-         InlineKeyboardButton("⚙ Settings", callback_data="ad:settings", style="primary")],
-        [InlineKeyboardButton("🛡 Admin Manager", callback_data="ad:adminmgr", style="danger")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="ad:stats", style="primary"),
+         InlineKeyboardButton("🛠 Maintenance", callback_data="ad:maintenance", style="danger")],
+        [InlineKeyboardButton("⚙ Settings", callback_data="ad:settings", style="primary")],
+        [InlineKeyboardButton("🛡 Admin Manager", callback_data="ad:adminmgr", style="primary")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1681,11 +1641,11 @@ async def send_force_join_prompt(update: Update, missing: list[dict]) -> None:
 (RD_CODE,) = range(20, 21)
 (FC_ADD,) = range(30, 31)
 (UM_SEARCH, UM_AMOUNT) = range(40, 42)
-(RM_CODE, RM_COINS, RM_PREMIUM, RM_LIMIT, RM_EXPIRY, RM_DELETE) = range(50, 56)
+(RM_CODE, RM_COINS, RM_LIMIT, RM_EXPIRY, RM_DELETE) = range(50, 55)
 (BR_CONTENT,) = range(60, 61)
 (ST_VALUE,) = range(70, 71)
 (EF_FIELD,) = range(80, 81)
-(WB_IDS, WB_ACTION, WB_AMOUNT, WB_PREMIUM) = range(90, 94)
+(WB_IDS, WB_ACTION, WB_AMOUNT) = range(90, 93)
 (GC_AMOUNT,) = range(96, 97)
 (AM_ADD_USER, AM_ADD_ROLE) = range(97, 99)
 (TK_SUBJECT, TK_BODY, TK_REPLY, TK_USER_REPLY) = range(99, 103)
@@ -1948,9 +1908,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user.id,))
         ref_count = (await cur.fetchone())[0]
 
-    is_premium = await is_premium_active(user.id)
-    premium_line = "👑 <b>Premium — Active</b>" if is_premium else "⭐ Premium: <i>Not Active</i>"
-    name_tag = f"👑 {html.escape(user.first_name or 'Friend')}" if is_premium else html.escape(user.first_name or "Friend")
+    name_tag = html.escape(user.first_name or "Friend")
 
     text = (
         f"🫴🏻 <b>Welcome , {name_tag}!</b>\n\n"
@@ -1959,7 +1917,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🪙 <b>Wallet:</b> {balance} Coins\n"
         f"💬 <b>Buy coins:</b> @duifioookn2\n"
         f"👥 <b>Referrals:</b> {ref_count}\n"
-        f"{premium_line}\n"
         f"{DIVIDER}\n\n"
         f"Keyboard Button Ka Use Karo 👇"
     )
@@ -2070,7 +2027,7 @@ async def conv_ticket_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Reply", callback_data=f"ticket:reply:{ticket_id}", style="primary"),
-         InlineKeyboardButton("✅ Close", callback_data=f"ticket:close:{ticket_id}", style="danger")],
+         InlineKeyboardButton("✅ Close", callback_data=f"ticket:close:{ticket_id}", style="success")],
     ])
     for admin_id in await get_all_admin_ids():
         try:
@@ -2183,7 +2140,7 @@ async def conv_ticket_user_reply(update: Update, context: ContextTypes.DEFAULT_T
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 Reply", callback_data=f"ticket:reply:{ticket_id}", style="primary"),
-         InlineKeyboardButton("✅ Close", callback_data=f"ticket:close:{ticket_id}", style="danger")],
+         InlineKeyboardButton("✅ Close", callback_data=f"ticket:close:{ticket_id}", style="success")],
     ])
     for admin_id in await get_all_admin_ids():
         try:
@@ -2315,15 +2272,12 @@ async def send_wallet_view(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     async with db_conn() as db:
         cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user.id,))
         ref_count = (await cur.fetchone())[0]
-    is_premium = await is_premium_active(user.id)
-    premium_line = "👑 <b>Premium — Active</b>" if is_premium else "⭐ Premium: <i>Not Active</i>"
 
     text = (
         "💼 <b>My Wallet</b>\n"
         f"{DIVIDER}\n"
         f"🪙 <b>Coins:</b> {balance}\n"
         f"👥 <b>Total Referrals:</b> {ref_count}\n"
-        f"{premium_line}\n"
         f"{DIVIDER}\n"
         "💬 <b>Buy coins:</b> DM @duifioookn2"
     )
@@ -2637,12 +2591,8 @@ async def handle_redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if redeem["coin_reward"]:
             await add_coins(user.id, redeem["coin_reward"], "redeem", f"Redeem code {code}")
-        if redeem["premium_days"]:
-            await grant_premium(user.id, redeem["premium_days"], admin_id=0)
 
     msg = f"✅ <b>Redeem Successful!</b>\n🪙 +{redeem['coin_reward']} Coins"
-    if redeem["premium_days"]:
-        msg += f"\n⭐ +{redeem['premium_days']} Days Premium"
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=user_reply_keyboard(admin))
     return ConversationHandler.END
 
@@ -2730,8 +2680,6 @@ async def handle_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         spent = abs((await cur.fetchone())[0])
 
-    is_premium = await is_premium_active(user.id)
-    premium_line = "👑 <b>Premium — Active</b>" if is_premium else "⭐ Premium: <i>Not Active</i>"
     text = (
         "📊 <b>My Stats</b>\n"
         f"{DIVIDER}\n"
@@ -2744,7 +2692,6 @@ async def handle_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"🎁 <b>Redeem Count:</b> {redeems}\n"
         f"📈 <b>Coins Earned:</b> {earned}\n"
         f"📉 <b>Coins Spent:</b> {spent}\n"
-        f"{premium_line}\n"
         f"{DIVIDER}"
     )
     await update.effective_message.reply_text(
@@ -2949,7 +2896,7 @@ async def _render_product_details(update: Update, product, category: str, page: 
     cat = product["category"]
     rows.append([
         InlineKeyboardButton("⬅ Back", callback_data=f"buy:cat:{cat}:{page}", style="primary"),
-        InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="success"),
+        InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="primary"),
     ])
     kb = InlineKeyboardMarkup(rows)
 
@@ -3213,7 +3160,7 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬇ Redeliver", callback_data=f"buy:redeliver:{product_id}", style="success")],
-                    [InlineKeyboardButton("🛒 Buy Menu", callback_data="buy:home", style="success")],
+                    [InlineKeyboardButton("🛒 Buy Menu", callback_data="buy:home", style="primary")],
                 ]),
             )
         except BadRequest:
@@ -3228,7 +3175,7 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "You will not be charged again. Tap Redeliver to try again, or contact support.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬇ Retry Delivery", callback_data=f"buy:redeliver:{product_id}", style="danger")],
+                    [InlineKeyboardButton("⬇ Retry Delivery", callback_data=f"buy:redeliver:{product_id}", style="success")],
                     [InlineKeyboardButton("💬 Support", callback_data="buy:support", style="primary")],
                 ]),
             )
@@ -3491,12 +3438,12 @@ async def cb_my_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for r in files:
             lines.append(f"• {html.escape(r['file_name'])}")
             buttons.append([InlineKeyboardButton(
-                f"⬇ {r['file_name']}", callback_data=f"file:dl:{r['file_pk']}", style="primary",
+                f"⬇ {r['file_name']}", callback_data=f"file:dl:{r['file_pk']}", style="success",
             )])
     if not products and not files:
         lines.append("\nYou haven't purchased anything yet.")
 
-    buttons.append([InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="success")])
+    buttons.append([InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="primary")])
     text = "\n".join(lines)
     if len(text) > 3900:
         text = text[:3800] + "…"
@@ -4115,7 +4062,7 @@ async def cb_pm_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"pm:delok:{pid}", style="danger"),
-         InlineKeyboardButton("❌ No", callback_data=f"pm:view:{pid}", style="danger")],
+         InlineKeyboardButton("❌ No", callback_data=f"pm:view:{pid}", style="primary")],
     ])
     await query.edit_message_text(
         f"⚠️ <b>Delete Product?</b>\n\n🧩 {html.escape(product['name'])}\n🆔 #{pid}\n\n"
@@ -4903,8 +4850,8 @@ async def cb_mf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await query.answer()
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"mf:delconfirm:{file_pk}", style="success"),
-         InlineKeyboardButton("❌ No", callback_data=f"mf:view:{file_pk}:0", style="danger")],
+        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"mf:delconfirm:{file_pk}", style="danger"),
+         InlineKeyboardButton("❌ No", callback_data=f"mf:view:{file_pk}:0", style="primary")],
     ])
     await query.edit_message_text("⚠️ Are you sure you want to delete this file?", reply_markup=kb)
 
@@ -5230,7 +5177,6 @@ async def conv_wm_bulk_ids(update: Update, context: ContextTypes.DEFAULT_TYPE) -
          InlineKeyboardButton("➖ Remove Coins", callback_data="wb:remove", style="danger")],
         [InlineKeyboardButton("🚫 Ban All", callback_data="wb:ban", style="danger"),
          InlineKeyboardButton("✅ Unban All", callback_data="wb:unban", style="success")],
-        [InlineKeyboardButton("👑 Give Premium", callback_data="wb:premium", style="primary")],
         [InlineKeyboardButton("❌ Cancel", callback_data="wb:cancel", style="danger")],
     ])
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -5306,39 +5252,6 @@ async def cb_wb_action_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await db.commit()
     action_word = "Banned" if banned else "Unbanned"
     await query.message.reply_text(f"✅ <b>{action_word}</b> {len(target_ids)} users.", parse_mode=ParseMode.HTML)
-    return ConversationHandler.END
-
-
-async def cb_wb_action_premium_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("7 Days", callback_data="wb:pset:7", style="primary"),
-         InlineKeyboardButton("30 Days", callback_data="wb:pset:30", style="primary")],
-        [InlineKeyboardButton("90 Days", callback_data="wb:pset:90", style="primary"),
-         InlineKeyboardButton("Lifetime", callback_data="wb:pset:0", style="primary")],
-    ])
-    await query.message.reply_text("👑 Select Premium duration to grant to all selected users:", reply_markup=kb)
-    return WB_PREMIUM
-
-
-async def cb_wb_action_premium_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    days = int(query.data.split(":")[2])
-    target_ids = context.user_data.pop("wb_ids")
-    for uid in target_ids:
-        await grant_premium(uid, None if days == 0 else days, update.effective_user.id)
-        await TELEGRAM_SEND_LIMITER.acquire()
-        try:
-            label = "Lifetime" if days == 0 else f"{days} days"
-            await context.bot.send_message(
-                uid, f"👑 <b>You've been granted Premium!</b>\nDuration: {label}", parse_mode=ParseMode.HTML
-            )
-        except TelegramError:
-            pass
-    label = "Lifetime" if days == 0 else f"{days} Days"
-    await query.message.reply_text(f"✅ Granted <b>{label}</b> Premium to {len(target_ids)} users.", parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 
@@ -5444,16 +5357,6 @@ async def conv_rm_coins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             )
             return RM_COINS
     context.user_data["rm_coins"] = amount
-    await update.message.reply_text("⭐ Enter Premium Reward in days (0 for none):")
-    return RM_PREMIUM
-
-
-async def conv_rm_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Please enter a valid number.")
-        return RM_PREMIUM
-    context.user_data["rm_premium"] = int(text)
     await update.message.reply_text("🔢 Enter Usage Limit (0 for unlimited):")
     return RM_LIMIT
 
@@ -5482,15 +5385,15 @@ async def conv_rm_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with db_conn() as db:
         await db.execute(
             "INSERT INTO redeems (code, coin_reward, premium_days, usage_limit, expiry_date, status, created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
-            (d["rm_code"], d["rm_coins"], d["rm_premium"], d["rm_limit"], expiry_iso,
+            "VALUES (?, ?, 0, ?, ?, 'active', ?, ?)",
+            (d["rm_code"], d["rm_coins"], d["rm_limit"], expiry_iso,
              update.effective_user.id, datetime.utcnow().isoformat()),
         )
         await db.commit()
 
     await update.message.reply_text(
         f"✅ <b>Redeem Code Created!</b>\n\n🎟 Code: <code>{d['rm_code']}</code>\n💰 Coins: {d['rm_coins']}\n"
-        f"⭐ Premium Days: {d['rm_premium']}\n🔢 Usage Limit: {d['rm_limit'] or 'Unlimited'}\n"
+        f"🔢 Usage Limit: {d['rm_limit'] or 'Unlimited'}\n"
         f"📅 Expiry: {text if text != '-' else 'Never'}",
         parse_mode=ParseMode.HTML,
     )
@@ -5498,7 +5401,7 @@ async def conv_rm_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.bot, update.effective_user.id,
         f"🎟 Created redeem code <code>{d['rm_code']}</code> — {d['rm_coins']} coins"
     )
-    for k in ["rm_code", "rm_coins", "rm_premium", "rm_limit"]:
+    for k in ["rm_code", "rm_coins", "rm_limit"]:
         context.user_data.pop(k, None)
     return ConversationHandler.END
 
@@ -5565,8 +5468,8 @@ async def cb_rm_delete_all_confirm(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("No redeem codes to delete.", reply_markup=back_button("ad:redeemmgr"))
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, Delete ALL", callback_data="rm:delallconfirm", style="success"),
-         InlineKeyboardButton("❌ No", callback_data="ad:redeemmgr", style="danger")],
+        [InlineKeyboardButton("✅ Yes, Delete ALL", callback_data="rm:delallconfirm", style="danger"),
+         InlineKeyboardButton("❌ No", callback_data="ad:redeemmgr", style="primary")],
     ])
     await query.edit_message_text(
         f"⚠️ <b>Delete ALL {count} Redeem Codes?</b>\n\nThis cannot be undone.",
@@ -5630,7 +5533,6 @@ async def send_user_profile(message_or_query, target_id: int, edit: bool = False
     async with db_conn() as db:
         cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (target_id,))
         refs = (await cur.fetchone())[0]
-    premium = "⭐ Active" if await is_premium_active(target_id) else "❌ None"
     banned = "🚫 Banned" if row["is_banned"] else "✅ Active"
 
     text = (
@@ -5641,7 +5543,6 @@ async def send_user_profile(message_or_query, target_id: int, edit: bool = False
         f"📅 Joined: {fmt_date(row['join_date'])}\n"
         f"🪙 Wallet: {balance}\n"
         f"👥 Referrals: {refs}\n"
-        f"⭐ Premium: {premium}\n"
         f"🔒 Status: {banned}"
     )
     is_owner = message_or_query.from_user.id == OWNER_ID
@@ -5652,8 +5553,6 @@ async def send_user_profile(message_or_query, target_id: int, edit: bool = False
     if is_owner:
         rows.append([InlineKeyboardButton("🚫 Ban", callback_data=f"um:ban:{target_id}", style="danger"),
                      InlineKeyboardButton("✅ Unban", callback_data=f"um:unban:{target_id}", style="success")])
-    rows.append([InlineKeyboardButton("👑 Give Premium", callback_data=f"um:givep:{target_id}", style="primary"),
-                 InlineKeyboardButton("❌ Remove Premium", callback_data=f"um:remp:{target_id}", style="danger")])
     kb = InlineKeyboardMarkup(rows)
     if hasattr(message_or_query, "edit_message_text") and edit:
         await message_or_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -5734,46 +5633,6 @@ async def cb_um_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_user_profile(query, target_id, edit=True)
 
 
-async def cb_um_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    action, target_id = query.data.split(":")[1], int(query.data.split(":")[2])
-    if action == "remp":
-        await remove_premium(target_id)
-        await query.answer("✅ Premium removed")
-        await send_user_profile(query, target_id, edit=True)
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("7 Days", callback_data=f"um:pset:{target_id}:7", style="primary"),
-         InlineKeyboardButton("30 Days", callback_data=f"um:pset:{target_id}:30", style="primary")],
-        [InlineKeyboardButton("90 Days", callback_data=f"um:pset:{target_id}:90", style="primary"),
-         InlineKeyboardButton("Lifetime", callback_data=f"um:pset:{target_id}:0", style="primary")],
-        [InlineKeyboardButton("⬅ Back", callback_data=f"um:back:{target_id}", style="primary")],
-    ])
-    await query.answer()
-    await query.edit_message_text("👑 Select Premium Duration:", reply_markup=kb)
-
-
-async def cb_um_pset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    _, _, target_id, days = query.data.split(":")
-    target_id, days = int(target_id), int(days)
-    await grant_premium(target_id, None if days == 0 else days, update.effective_user.id)
-    await query.answer("✅ Premium granted")
-    try:
-        await context.bot.send_message(
-            target_id,
-            f"👑 <b>You've been granted Premium!</b>\nDuration: {'Lifetime' if days==0 else f'{days} days'}",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        pass
-    await log_admin_action(
-        context.bot, update.effective_user.id,
-        f"👑 Granted {'Lifetime' if days == 0 else f'{days} days'} Premium to user {target_id}"
-    )
-    await send_user_profile(query, target_id, edit=True)
-
-
 async def cb_um_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     target_id = int(query.data.split(":")[2])
@@ -5808,34 +5667,6 @@ async def conv_um_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYP
             f"✅ Removed {amount} coins from user {target_id}." if ok else "❌ Insufficient balance to remove that amount."
         )
     return ConversationHandler.END
-
-
-
-async def cb_admin_premiummgr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_admin(update.effective_user.id):
-        if update.callback_query:
-            await update.callback_query.answer(ADMIN_ONLY_MSG, show_alert=True)
-        else:
-            await update.effective_message.reply_text(ADMIN_ONLY_MSG)
-        return
-    if update.callback_query:
-        await update.callback_query.answer()
-    async with db_conn() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM premium ORDER BY granted_at DESC LIMIT 20")
-        rows = await cur.fetchall()
-    if not rows:
-        text = "👑 <b>Premium Manager</b>\n\nNo premium users yet.\n\nUse 👥 User Manager to grant premium to a specific user."
-    else:
-        lines = ["👑 <b>Premium Users</b>\n"]
-        for r in rows:
-            status = "Lifetime" if r["is_lifetime"] else fmt_date(r["expiry_date"])
-            lines.append(f"🆔 <code>{r['user_id']}</code> — {status}")
-        text = "\n".join(lines)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_button("ad:home"))
-    else:
-        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 
@@ -6107,10 +5938,6 @@ async def cb_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "SELECT COUNT(*) FROM users WHERE last_seen > ?",
             ((datetime.utcnow() - timedelta(days=7)).isoformat(),)
         )).fetchone())[0]
-        premium_users = (await (await db.execute(
-            "SELECT COUNT(*) FROM premium WHERE is_lifetime=1 OR expiry_date > ?",
-            (datetime.utcnow().isoformat(),)
-        )).fetchone())[0]
         total_files = (await (await db.execute("SELECT COUNT(*) FROM files WHERE is_deleted=0")).fetchone())[0]
         total_downloads = (await (await db.execute("SELECT COUNT(*) FROM downloads")).fetchone())[0]
         coins_distributed = (await (await db.execute(
@@ -6123,7 +5950,6 @@ async def cb_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "📊 <b>Statistics</b>\n\n"
         f"👥 Total Users: <b>{total_users}</b>\n"
         f"🟢 Active (7d): <b>{active_users}</b>\n"
-        f"⭐ Premium Users: <b>{premium_users}</b>\n"
         f"🛒 Total Files: <b>{total_files}</b>\n"
         f"⬇ Downloads: <b>{total_downloads}</b>\n"
         f"🪙 Coins Distributed: <b>{coins_distributed}</b>\n"
@@ -6276,15 +6102,6 @@ async def cb_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 
-async def job_expire_premium(context: ContextTypes.DEFAULT_TYPE) -> None:
-    async with db_conn() as db:
-        await db.execute(
-            "DELETE FROM premium WHERE is_lifetime=0 AND expiry_date IS NOT NULL AND expiry_date < ?",
-            (datetime.utcnow().isoformat(),),
-        )
-        await db.commit()
-
-
 async def job_expire_redeem_codes(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-deletes redeem codes past their expiry_date, along with their
     usage records, so admins never have to clean these up manually."""
@@ -6325,7 +6142,6 @@ TEXT_ROUTES = {
     "🎟 Redeem Manager": cb_admin_redeemmgr,
     "📡 Force Channels": cb_admin_fcmgr,
     "👤 All Users": cb_admin_all_users,
-    "👑 Premium Manager": cb_admin_premiummgr,
     "🛡 Admin Manager": cb_admin_adminmgr,
     "📋 Admin List": cb_admin_adminmgr,
     "📊 Statistics": cb_admin_stats,
@@ -6445,7 +6261,6 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_admin_walletmgr, pattern="^ad:walletmgr$"))
     app.add_handler(CallbackQueryHandler(cb_admin_redeemmgr, pattern="^ad:redeemmgr$"))
     app.add_handler(CallbackQueryHandler(cb_admin_fcmgr, pattern="^ad:fcmgr$"))
-    app.add_handler(CallbackQueryHandler(cb_admin_premiummgr, pattern="^ad:premiummgr$"))
     app.add_handler(CallbackQueryHandler(cb_admin_adminmgr, pattern="^ad:adminmgr$"))
     app.add_handler(CallbackQueryHandler(cb_am_remove_menu, pattern="^am:remove$"))
     app.add_handler(CallbackQueryHandler(cb_am_log_view, pattern=r"^am:log:\d+$"))
@@ -6625,11 +6440,9 @@ def build_application() -> Application:
             WB_ACTION: [
                 CallbackQueryHandler(cb_wb_action_coins, pattern="^wb:(add|remove)$"),
                 CallbackQueryHandler(cb_wb_action_ban, pattern="^wb:(ban|unban)$"),
-                CallbackQueryHandler(cb_wb_action_premium_menu, pattern="^wb:premium$"),
                 CallbackQueryHandler(cb_wb_cancel, pattern="^wb:cancel$"),
             ],
             WB_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_wm_bulk_amount)],
-            WB_PREMIUM: [CallbackQueryHandler(cb_wb_action_premium_set, pattern=r"^wb:pset:\d+$")],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
@@ -6642,7 +6455,6 @@ def build_application() -> Application:
         states={
             RM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_rm_code)],
             RM_COINS: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_rm_coins)],
-            RM_PREMIUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_rm_premium)],
             RM_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_rm_limit)],
             RM_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_rm_expiry)],
         },
@@ -6677,8 +6489,6 @@ def build_application() -> Application:
     )
     app.add_handler(um_conv)
     app.add_handler(CallbackQueryHandler(cb_um_ban, pattern=r"^um:(ban|unban):\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_um_premium, pattern=r"^um:(givep|remp):\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_um_pset, pattern=r"^um:pset:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_um_back, pattern=r"^um:back:\d+$"))
 
     app.add_handler(CallbackQueryHandler(cb_au_list, pattern=r"^au:list:\d+$"))
@@ -6734,7 +6544,6 @@ async def post_init(app: Application) -> None:
         raise
     await init_db_pool()
     if app.job_queue:
-        app.job_queue.run_repeating(job_expire_premium, interval=3600, first=10)
         app.job_queue.run_repeating(job_expire_redeem_codes, interval=3600, first=15)
         app.job_queue.run_repeating(job_channel_db_flush, interval=60, first=60)
     log.info("Bot initialized and ready.")
