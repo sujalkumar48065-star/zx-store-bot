@@ -113,6 +113,11 @@ CHANNEL_DB_REQUIRED = os.environ.get("CHANNEL_DB_REQUIRED", "0").strip().lower()
     "off",
 }
 CHANNEL_DB_SNAPSHOT_PREFIX = "zx_store_snapshot_"
+REMOVE_ADMIN_IDS = {
+    int(part)
+    for part in os.environ.get("REMOVE_ADMIN_IDS", "").replace(",", " ").split()
+    if part.lstrip("-").isdigit()
+}
 
 # Optional legacy product file storage can share the same channel.
 _PRODUCT_CHANNEL_ID = (
@@ -1271,6 +1276,18 @@ async def _init_db_schema() -> None:
     log.info("Database ready at %s", DB_PATH)
 
 
+async def _apply_admin_overrides() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO admins (user_id, added_date) VALUES (?, ?)",
+            (OWNER_ID, datetime.utcnow().isoformat()),
+        )
+        for admin_id in REMOVE_ADMIN_IDS:
+            if admin_id != OWNER_ID:
+                await db.execute("DELETE FROM admins WHERE user_id=?", (admin_id,))
+        await db.commit()
+
+
 async def init_db(bot=None, require_channel: bool | None = None) -> None:
     """Prepare the local database and, when a bot is supplied, synchronize it
     with the configured Telegram database channel."""
@@ -1299,6 +1316,7 @@ async def init_db(bot=None, require_channel: bool | None = None) -> None:
     await _init_db_schema()
 
     if store is None:
+        await _apply_admin_overrides()
         return
 
     if store.snapshot is not None:
@@ -1332,6 +1350,7 @@ async def init_db(bot=None, require_channel: bool | None = None) -> None:
                 local_flushed,
             )
 
+    await _apply_admin_overrides()
     store.activate()
     store.mark_dirty()
     _channel_db = store
