@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+*.db.bak
+*.log
+*.pid
+bot_token.txt
+.env
+.venv/
+venv/
