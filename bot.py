@@ -134,12 +134,6 @@ DEFAULT_SETTINGS = {
     "support_username": "duifioookn2",
     "force_join": "1",
     "maintenance": "0",
-    "premium_pricing": json.dumps([
-        {"days": 7, "price": 300},
-        {"days": 30, "price": 900},
-        {"days": 90, "price": 2200},
-        {"days": 0, "price": 6000},
-    ]),
     "referral_milestones": json.dumps([
         {"count": 5, "reward": 100},
         {"count": 10, "reward": 250},
@@ -1963,7 +1957,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🏷 <b>{html.escape(bot_name)}</b>\n"
         f"{DIVIDER}\n"
         f"🪙 <b>Wallet:</b> {balance} Coins\n"
-        f"💱 <b>1 Coin = ₹1</b>\n"
         f"💬 <b>Buy coins:</b> @duifioookn2\n"
         f"👥 <b>Referrals:</b> {ref_count}\n"
         f"{premium_line}\n"
@@ -1999,7 +1992,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>Help & Guide</b>\n\n"
         "🛒 <b>Buy</b> — Browse Bot Source Code and Method products.\n"
-        "🪙 <b>Coins</b> — 1 Coin = ₹1. Buy coins by DMing @duifioookn2, "
+        "🪙 <b>Coins</b> — Buy coins by DMing @duifioookn2, "
         "or earn them via Referrals and Redeem Codes.\n"
         "👥 <b>Referral</b> — Share your personal link, earn coins per new user.\n"
         "🎟️ <b>Redeem</b> — Enter a code from the admin to instantly get coins.\n"
@@ -2329,7 +2322,6 @@ async def send_wallet_view(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "💼 <b>My Wallet</b>\n"
         f"{DIVIDER}\n"
         f"🪙 <b>Coins:</b> {balance}\n"
-        f"💱 <b>Rate:</b> 1 Coin = ₹1\n"
         f"👥 <b>Total Referrals:</b> {ref_count}\n"
         f"{premium_line}\n"
         f"{DIVIDER}\n"
@@ -2339,57 +2331,11 @@ async def send_wallet_view(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         [InlineKeyboardButton("💬 Buy Coins via Owner", url="https://t.me/duifioookn2", style="success")],
         [InlineKeyboardButton("📜 Transactions", callback_data="wallet:tx:0", style="primary")],
     ]
-    if not is_premium:
-        buttons.append([InlineKeyboardButton("👑 Buy Premium with Coins", callback_data="wallet:buypremium", style="success")])
     kb = InlineKeyboardMarkup(buttons)
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-async def cb_wallet_buy_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if await is_premium_active(update.effective_user.id):
-        await query.answer("✅ You already have Premium active.", show_alert=True)
-        return
-    pricing = json.loads(await get_setting("premium_pricing", "[]"))
-    balance = await get_balance(update.effective_user.id)
-    lines = [f"👑 <b>Buy Premium with Coins</b>\n{DIVIDER}", f"🪙 Your balance: <b>{balance}</b>\n"]
-    buttons = []
-    for p in pricing:
-        label = "Lifetime" if p["days"] == 0 else f"{p['days']} Days"
-        lines.append(f"• {label} — 🪙 {p['price']}")
-        buttons.append([InlineKeyboardButton(f"👑 {label} — {p['price']} coins", callback_data=f"premium:buy:{p['days']}:{p['price']}", style="primary")])
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="wallet:home", style="primary")])
-    await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def cb_premium_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user = update.effective_user
-    _, _, days, price = query.data.split(":")
-    days, price = int(days), int(price)
-
-    lock = await get_user_action_lock(user.id)
-    async with lock:
-        if await is_premium_active(user.id):
-            await query.answer("✅ You already have Premium active.", show_alert=True)
-            return
-        ok = await remove_coins(user.id, price, "premium_purchase", f"Bought Premium ({'Lifetime' if days == 0 else f'{days} days'})")
-        if not ok:
-            await query.answer("❌ Not enough Coins for this plan.", show_alert=True)
-            return
-        await grant_premium(user.id, None if days == 0 else days, admin_id=0)
-
-    await query.answer("👑 Premium activated!")
-    label = "Lifetime" if days == 0 else f"{days} Days"
-    await query.edit_message_text(
-        f"🎉 <b>Premium Activated!</b>\n\n👑 Plan: <b>{label}</b>\n🪙 Paid: <b>{price} coins</b>\n\n"
-        "Enjoy your Premium badge, bonus multiplier, and priority support!",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def cb_wallet_tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2870,7 +2816,6 @@ async def handle_buy_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     text = (
         "🛒 <b>Buy</b>\n\n"
-        "💱 <b>1 Coin = ₹1</b>\n"
         "💬 <b>Buy coins:</b> DM @duifioookn2\n\n"
         "<b>Choose Option</b>"
     )
@@ -2940,7 +2885,7 @@ async def render_product_list(update: Update, category: str, page: int) -> None:
         text = f"<b>{title}</b>\n\nNo {title} Available"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="buy:home", style="primary")]])
     else:
-        text = f"<b>{title}</b>\n\nSelect a product to view details:\n\n💱 <b>1 Coin = ₹1</b>"
+        text = f"<b>{title}</b>\n\nSelect a product to view details:"
         kb_rows = _build_product_buttons(rows, category, page)
         nav = []
         if page > 0:
@@ -2991,8 +2936,7 @@ async def _render_product_details(update: Update, product, category: str, page: 
         f"{DIVIDER}\n"
         f"{description if description else '<i>No description provided.</i>'}\n"
         f"{DIVIDER}\n"
-        f"{price_line}\n"
-        "💱 <b>1 Coin = ₹1</b>"
+        f"{price_line}"
     )
     if owned:
         text += "\n✅ <b>You already own this product.</b>"
@@ -3223,7 +3167,6 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 ])
                 low_text = (
                     "❌ <b>Not enough Coins.</b>\n\n"
-                    "💱 <b>1 Coin = ₹1</b>\n"
                     "💬 <b>Buy coins:</b> DM @duifioookn2\n\n"
                     f"🧩 Product: <b>{html.escape(product['name'])}</b>\n"
                     f"🪙 Required: <b>{price}</b>\n"
@@ -6259,7 +6202,6 @@ async def cb_mt_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 SETTINGS_FIELDS = {
     "referral_reward": "🚀 Referral Reward (coins)",
-    "premium_pricing": "👑 Premium Pricing (JSON list)",
     "referral_milestones": "🚀 Referral Milestone Rewards (JSON)",
     "streak_rewards": "🔥 Login Streak Rewards (JSON)",
     "support_username": "💬 Support Username",
@@ -6435,7 +6377,6 @@ def build_application() -> Application:
 
     app.add_handler(CallbackQueryHandler(cb_wallet_home, pattern="^wallet:home$"))
     app.add_handler(CallbackQueryHandler(cb_wallet_tx, pattern="^wallet:tx:"))
-    app.add_handler(CallbackQueryHandler(cb_wallet_buy_premium, pattern="^wallet:buypremium$"))
 
     ticket_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🎫 Support Ticket$"), handle_support_ticket_prompt)],
@@ -6464,7 +6405,6 @@ def build_application() -> Application:
     )
     app.add_handler(ticket_user_reply_conv)
     app.add_handler(CallbackQueryHandler(cb_ticket_close, pattern=r"^ticket:close:\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_premium_purchase, pattern=r"^premium:buy:\d+:\d+$"))
 
 
     app.add_handler(MessageHandler(filters.Regex("^🎟️ Redeem Code$"), handle_redeem_prompt))
