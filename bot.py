@@ -106,7 +106,7 @@ def _env_float(name: str, default: float) -> float:
 # be private, and the bot must be an administrator with "Post Messages" and
 # "Pin Messages" permissions.
 DATABASE_CHANNEL_ID = _env_int("DATABASE_CHANNEL_ID", 0)
-CHANNEL_DB_FLUSH_INTERVAL = max(1.0, _env_float("CHANNEL_DB_FLUSH_INTERVAL", 10.0))
+CHANNEL_DB_FLUSH_INTERVAL = max(1.0, _env_float("CHANNEL_DB_FLUSH_INTERVAL", 4.0))
 CHANNEL_DB_REQUIRED = os.environ.get("CHANNEL_DB_REQUIRED", "0").strip().lower() not in {
     "0",
     "false",
@@ -855,10 +855,11 @@ class ChannelDatabase:
                     self.last_sequence,
                     len(envelope["tables"]),
                 )
-            elif document is not None:
-                log.warning(
-                    "Pinned message in DATABASE_CHANNEL_ID is not a ZX Store snapshot; "
-                    "a new snapshot will replace the pin."
+            else:
+                raise ChannelDatabaseError(
+                    "The pinned message in DATABASE_CHANNEL_ID is not a valid ZX Store "
+                    "database snapshot. Refusing to overwrite it. Unpin that message or "
+                    "pin a valid snapshot, then restart."
                 )
         self.initialized = True
         return self.snapshot
@@ -931,6 +932,11 @@ class ChannelDatabase:
             f"ZX Store database snapshot | v{CHANNEL_DB_VERSION} | seq {envelope['sequence']} "
             f"| {rows} rows | {len(envelope['tables'])} tables"
         )
+        tables = envelope.get("tables") or {}
+        if not tables or "settings" not in tables:
+            raise ChannelDatabaseError(
+                "Refusing to upload an empty or incomplete database snapshot."
+            )
         sent = await self._tg_call(
             self.bot.send_document,
             chat_id=self.channel_id,
@@ -939,6 +945,15 @@ class ChannelDatabase:
             disable_notification=True,
         )
         try:
+            uploaded = getattr(sent, "document", None)
+            if uploaded is None:
+                raise ChannelDatabaseError("Telegram did not return the uploaded snapshot file.")
+            verified_file = await self._tg_call(self.bot.get_file, uploaded.file_id)
+            verified_bytes = await self._download_bytes(verified_file)
+            if verified_bytes != data:
+                raise ChannelDatabaseError(
+                    "Channel snapshot verification failed; keeping the previous snapshot."
+                )
             await self._tg_call(
                 self.bot.pin_chat_message,
                 chat_id=self.channel_id,
@@ -1553,8 +1568,8 @@ async def remove_coins(user_id: int, amount: int, tx_type: str, description: str
 def user_reply_keyboard(admin: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("Buy", style="success")],
-        [KeyboardButton("My Wallet", style="success"), KeyboardButton("Invite Friend", style="success")],
-        [KeyboardButton("Leaderboard", style="primary"), KeyboardButton("Referral Code", style="success")],
+        [KeyboardButton("My Wallet", style="primary"), KeyboardButton("Invite Friend & Earn Coins", style="success")],
+        [KeyboardButton("Leaderboard", style="primary"), KeyboardButton("Redeem Code", style="success")],
         [KeyboardButton("My Stats", style="primary"), KeyboardButton("Support", style="primary")],
     ]
     if admin:
@@ -1570,10 +1585,9 @@ def admin_reply_keyboard(is_owner: bool = True) -> ReplyKeyboardMarkup:
     colored buttons in Telegram; see requirements.txt."""
     admin_mgr_label = "🛡 Admin Manager" if is_owner else "📋 Admin List"
     buttons = [
-        "📤 Upload File", "📂 Manage Files",
-        "🛒 Product Manager", "💹 Economy Manager",
-        "🚀 Referral Manager", "💰 Wallet Manager",
-        "🎟 Redeem Manager",
+        "📤 Upload", "🗂 Manage",
+        "💹 Economy Manager", "🚀 Referral Manager",
+        "💰 Wallet Manager", "🎟 Redeem Manager",
     ]
     if is_owner:
         buttons += ["📡 Force Channels"]
@@ -1583,7 +1597,7 @@ def admin_reply_keyboard(is_owner: bool = True) -> ReplyKeyboardMarkup:
     buttons += [admin_mgr_label]
 
     button_styles = {
-        "📤 Upload File": "success",
+        "📤 Upload": "success",
         "📢 Broadcast": "danger",
         "🛠 Maintenance": "danger",
     }
@@ -1600,19 +1614,18 @@ def admin_reply_keyboard(is_owner: bool = True) -> ReplyKeyboardMarkup:
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("📤 Upload File", callback_data="ad:upload", style="success"),
-         InlineKeyboardButton("📂 Manage Files", callback_data="ad:managefiles", style="primary")],
-        [InlineKeyboardButton("🛒 Product Manager", callback_data="ad:products", style="primary"),
-         InlineKeyboardButton("💹 Economy Manager", callback_data="ad:economy", style="primary")],
-        [InlineKeyboardButton("🚀 Referral Manager", callback_data="ad:referrals", style="primary"),
-         InlineKeyboardButton("💰 Wallet Manager", callback_data="ad:walletmgr", style="primary")],
-        [InlineKeyboardButton("🎟 Redeem Manager", callback_data="ad:redeemmgr", style="primary"),
-         InlineKeyboardButton("📡 Force Channels", callback_data="ad:fcmgr", style="primary")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="ad:broadcast", style="danger"),
-         InlineKeyboardButton("👥 User Manager", callback_data="ad:usermgr", style="primary")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="ad:stats", style="primary"),
-         InlineKeyboardButton("🛠 Maintenance", callback_data="ad:maintenance", style="danger")],
-        [InlineKeyboardButton("⚙ Settings", callback_data="ad:settings", style="primary")],
+        [InlineKeyboardButton("📤 Upload", callback_data="pm:addsel", style="success"),
+         InlineKeyboardButton("🗂 Manage", callback_data="pm:manage:0", style="primary")],
+        [InlineKeyboardButton("💹 Economy Manager", callback_data="ad:economy", style="primary"),
+         InlineKeyboardButton("🚀 Referral Manager", callback_data="ad:referrals", style="primary")],
+        [InlineKeyboardButton("💰 Wallet Manager", callback_data="ad:walletmgr", style="primary"),
+         InlineKeyboardButton("🎟 Redeem Manager", callback_data="ad:redeemmgr", style="primary")],
+        [InlineKeyboardButton("📡 Force Channels", callback_data="ad:fcmgr", style="primary"),
+         InlineKeyboardButton("📢 Broadcast", callback_data="ad:broadcast", style="danger")],
+        [InlineKeyboardButton("👥 User Manager", callback_data="ad:usermgr", style="primary"),
+         InlineKeyboardButton("📊 Statistics", callback_data="ad:stats", style="primary")],
+        [InlineKeyboardButton("🛠 Maintenance", callback_data="ad:maintenance", style="danger"),
+         InlineKeyboardButton("⚙ Settings", callback_data="ad:settings", style="primary")],
         [InlineKeyboardButton("🛡 Admin Manager", callback_data="ad:adminmgr", style="primary")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1970,7 +1983,6 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🏷 <b>{html.escape(bot_name)}</b>\n"
         f"{DIVIDER}\n"
         f"🪙 <b>Wallet:</b> {balance} Coins\n"
-        f"💬 <b>Buy coins:</b> @duifioookn2\n"
         f"👥 <b>Referrals:</b> {ref_count}\n"
         f"{DIVIDER}\n\n"
         f"Keyboard Button Ka Use Karo 👇"
@@ -2004,10 +2016,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>Help & Guide</b>\n\n"
         "🛒 <b>Buy</b> — Browse Source Code, Method, and Product items.\n"
-        "🪙 <b>Coins</b> — Buy coins by DMing @duifioookn2, "
-        "or earn them via Referrals and Redeem Codes.\n"
-        "👥 <b>Referral</b> — Share your personal link, earn coins per new user.\n"
-        "🎟️ <b>Redeem</b> — Enter a code from the admin to instantly get coins.\n"
+        "🪙 <b>Coins</b> — Wallet me balance dekho, Invite se coins kamao, "
+        "ya Redeem Code se code redeem karo.\n"
+        "👥 <b>Invite</b> — Apna invite link share karo aur coins kamao.\n"
+        "🎟️ <b>Redeem Code</b> — Admin ka diya hua code enter karke coins pao.\n"
         "💬 <b>Support</b> — Reach out any time via the Support menu.\n"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -2333,8 +2345,8 @@ async def send_wallet_view(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         f"{DIVIDER}\n"
         f"🪙 <b>Coins:</b> {balance}\n"
         f"👥 <b>Total Referrals:</b> {ref_count}\n"
-        f"{DIVIDER}\n"
-        "💬 <b>Buy coins:</b> DM @duifioookn2"
+        f"💱 <b>1 Coin = ₹1</b>\n"
+        f"{DIVIDER}"
     )
     buttons = [
         [InlineKeyboardButton("💬 Buy Coins via Owner", url="https://t.me/duifioookn2", style="success")],
@@ -2463,7 +2475,7 @@ async def handle_invite_friends(update: Update, context: ContextTypes.DEFAULT_TY
         else "Referral rewards are currently <b>paused</b> by the admin."
     share_url = f"https://t.me/share/url?url={link}&text=Join%20this%20store%20bot"
     text = (
-        "🚀 <b>Invite Friends</b>\n\n"
+        "🚀 <b>Invite Friend & Earn Coins</b>\n\n"
         f"{status_line}\n\n"
         f"🔗 <code>{link}</code>\n\n"
         f"👥 Total Referrals: <b>{count}</b>\n"
@@ -2566,18 +2578,17 @@ async def handle_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 
-async def handle_redeem_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_redeem_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await guard_user(update, context):
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Redeem a Code", callback_data="redeem:enter", style="success")],
-        [InlineKeyboardButton("🎁 Convert Coins to Gift Code", callback_data="redeem:gift", style="success")],
-    ])
+        return ConversationHandler.END
     await update.effective_message.reply_text(
-        "🎟️ <b>Redeem Center</b>\n\nWhat would you like to do?",
+        "🎟️ <b>Redeem Code</b>\n\nEnter your redeem code:",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="redeem:cancel", style="danger")],
+        ]),
     )
+    return RD_CODE
 
 
 async def cb_redeem_enter_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2704,7 +2715,7 @@ async def conv_gift_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.message.reply_text(
         f"✅ <b>Gift Code Created!</b>\n\n🎟 Code: <code>{code}</code>\n🪙 Value: <b>{amount} Coins</b>\n\n"
-        "Share this code with anyone — they can redeem it once via 🎟️ Redeem Code → Redeem a Code.",
+        "Share this code with anyone — they can redeem it once via the Redeem Code button.",
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
@@ -2818,7 +2829,6 @@ async def handle_buy_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     text = (
         "🛒 <b>Buy</b>\n\n"
-        "💬 <b>Buy coins:</b> DM @duifioookn2\n\n"
         "<b>Choose Option</b>"
     )
     kb = InlineKeyboardMarkup([
@@ -3170,12 +3180,11 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 balance = await get_balance(user.id)
                 await query.answer("❌ Not enough Coins.", show_alert=True)
                 low_kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💼 Open Wallet", callback_data="wallet:home", style="success")],
+                    [InlineKeyboardButton("💼 Open Wallet", callback_data="wallet:home", style="primary")],
                     [InlineKeyboardButton("⬅ Back", callback_data=f"buy:cat:{product['category']}:0", style="primary")],
                 ])
                 low_text = (
                     "❌ <b>Not enough Coins.</b>\n\n"
-                    "💬 <b>Buy coins:</b> DM @duifioookn2\n\n"
                     f"🧩 Product: <b>{html.escape(product['name'])}</b>\n"
                     f"🪙 Required: <b>{price}</b>\n"
                     f"👛 Your balance: <b>{balance}</b>"
@@ -3412,7 +3421,7 @@ async def cb_file_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await query.edit_message_text(
                     "❌ <b>Not enough Coins.</b>\n\nPlease top up your wallet to continue.",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 Open Wallet", callback_data="wallet:home", style="success")]]),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💼 Open Wallet", callback_data="wallet:home", style="primary")]]),
                 )
                 return
 
@@ -3532,60 +3541,94 @@ async def require_admin(update: Update) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Admin: Product Manager
+# Admin: Product Upload / Manage
 # ---------------------------------------------------------------------------
+
+def _pm_upload_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💻 Source Code", callback_data="pm:add:bot", style="primary")],
+        [InlineKeyboardButton("📘 Method", callback_data="pm:add:method", style="primary")],
+        [InlineKeyboardButton("📦 Product", callback_data="pm:add:product", style="primary")],
+        [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
+    ])
+
+
+async def _pm_show_upload_choice(update: Update, edit: bool = False) -> None:
+    text = "📤 <b>Upload Product</b>\n\n<b>Choose a category</b>"
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_pm_upload_choice_kb()
+        )
+    else:
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_pm_upload_choice_kb()
+        )
+
+
+async def handle_admin_upload_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    await _pm_show_upload_choice(update)
+
+
+async def _pm_manage_choice_kb() -> InlineKeyboardMarkup:
+    async with db_conn() as db:
+        rows = await (await db.execute(
+            "SELECT category, COUNT(*) FROM products WHERE is_deleted=0 GROUP BY category"
+        )).fetchall()
+    counts = {r[0]: r[1] for r in rows}
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💻 Source Code ({counts.get('bot', 0)})",
+            callback_data="pm:list:bot:0", style="primary",
+        )],
+        [InlineKeyboardButton(
+            f"📘 Method ({counts.get('method', 0)})",
+            callback_data="pm:list:method:0", style="primary",
+        )],
+        [InlineKeyboardButton(
+            f"📦 Product ({counts.get('product', 0)})",
+            callback_data="pm:list:product:0", style="primary",
+        )],
+        [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
+    ])
+
+
+async def _pm_show_manage_choice(update: Update, edit: bool = False) -> None:
+    text = (
+        "🗂 <b>Manage Products</b>\n"
+        f"{DIVIDER}\n\n"
+        "<b>Choose a category</b>"
+    )
+    kb = await _pm_manage_choice_kb()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+    else:
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=kb
+        )
+
+
+async def handle_admin_manage_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    await _pm_show_manage_choice(update)
+
 
 async def cb_admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update):
         return
     if update.callback_query:
         await update.callback_query.answer()
-    async with db_conn() as db:
-        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0")
-        total = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND is_active=1")
-        active = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='bot'")
-        source = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='method'")
-        methods = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='product'")
-        products_count = (await cur.fetchone())[0]
-    text = (
-        "🛒 <b>Product Manager</b>\n"
-        f"{DIVIDER}\n"
-        f"🧩 Total: <b>{total}</b>\n"
-        f"✅ Active: <b>{active}</b>\n"
-        f"💻 Source Code: <b>{source}</b>\n"
-        f"📘 Method: <b>{methods}</b>\n"
-        f"📦 Product: <b>{products_count}</b>"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Upload", callback_data="pm:addsel", style="success")],
-        [InlineKeyboardButton("🗂 Manage", callback_data="pm:manage:0", style="primary")],
-        [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
-    ])
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    else:
-        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
+    await _pm_show_manage_choice(update, edit=True)
 
 async def cb_pm_add_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await require_admin(update):
         return ConversationHandler.END
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📤 <b>Upload Product</b>\n\n<b>Choose a category</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💻 Source Code", callback_data="pm:add:bot", style="primary")],
-            [InlineKeyboardButton("📘 Method", callback_data="pm:add:method", style="primary")],
-            [InlineKeyboardButton("📦 Product", callback_data="pm:add:product", style="primary")],
-            [InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")],
-        ]),
-    )
+    await update.callback_query.answer()
+    await _pm_show_upload_choice(update, edit=True)
     return ConversationHandler.END
 
 
@@ -3626,7 +3669,7 @@ async def cb_pm_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def conv_pm_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     draft = context.user_data.get("pm_draft")
     if not draft:
-        await update.message.reply_text("❌ Session expired. Please start again from Product Manager.")
+        await update.message.reply_text("❌ Session expired. Please start again from Admin Panel → Upload.")
         return ConversationHandler.END
     name = update.message.text.strip()
     if not name:
@@ -4077,34 +4120,8 @@ async def cb_pm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def cb_pm_manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update):
         return
-    query = update.callback_query
-    await query.answer()
-    async with db_conn() as db:
-        rows = await (await db.execute(
-            "SELECT category, COUNT(*) FROM products WHERE is_deleted=0 GROUP BY category"
-        )).fetchall()
-    counts = {r[0]: r[1] for r in rows}
-    text = (
-        "🗂 <b>Manage Products</b>\n"
-        f"{DIVIDER}\n\n"
-        "<b>Choose a category</b>"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"💻 Source Code ({counts.get('bot', 0)})",
-            callback_data="pm:list:bot:0", style="primary",
-        )],
-        [InlineKeyboardButton(
-            f"📘 Method ({counts.get('method', 0)})",
-            callback_data="pm:list:method:0", style="primary",
-        )],
-        [InlineKeyboardButton(
-            f"📦 Product ({counts.get('product', 0)})",
-            callback_data="pm:list:product:0", style="primary",
-        )],
-        [InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")],
-    ])
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await update.callback_query.answer()
+    await _pm_show_manage_choice(update, edit=True)
 
 async def cb_pm_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update):
@@ -6334,14 +6351,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 TEXT_ROUTES = {
     "Buy": handle_buy_home,
     "My Wallet": handle_my_wallet,
-    "Invite Friend": handle_invite_friends,
+    "Invite Friend & Earn Coins": handle_invite_friends,
     "Leaderboard": handle_leaderboard,
-    "Referral Code": handle_referral_code,
     "My Stats": handle_my_stats,
     "Support": handle_support,
     "👑 Admin Panel": handle_admin_panel,
-    "📂 Manage Files": cb_admin_managefiles,
-    "🛒 Product Manager": cb_admin_products,
+    "📤 Upload": handle_admin_upload_entry,
+    "🗂 Manage": handle_admin_manage_entry,
     "💹 Economy Manager": cb_admin_economy,
     "🚀 Referral Manager": cb_admin_referrals,
     "💰 Wallet Manager": cb_admin_walletmgr,
@@ -6429,11 +6445,13 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_ticket_close, pattern=r"^ticket:close:\d+$"))
 
 
-    app.add_handler(MessageHandler(filters.Regex("^🎟️ Redeem Code$"), handle_redeem_prompt))
     app.add_handler(CallbackQueryHandler(cb_redeem_cancel, pattern="^redeem:cancel$"))
 
     redeem_enter_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_redeem_enter_start, pattern="^redeem:enter$")],
+        entry_points=[
+            MessageHandler(filters.Regex("^Redeem Code$"), handle_redeem_prompt),
+            CallbackQueryHandler(handle_redeem_prompt, pattern="^redeem:enter$"),
+        ],
         states={RD_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redeem_code)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_message=False,
