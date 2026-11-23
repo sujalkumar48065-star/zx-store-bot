@@ -1528,7 +1528,7 @@ def user_reply_keyboard(admin: bool) -> ReplyKeyboardMarkup:
         [KeyboardButton("My Stats", style="primary"), KeyboardButton("Support", style="primary")],
     ]
     if admin:
-        rows.append([KeyboardButton("👑 Admin Panel", style="danger")])
+        rows.append([KeyboardButton("👑 Admin Panel", style="primary")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
