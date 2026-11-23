@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timedelta
 
 import aiosqlite
+import httpx
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -113,6 +114,11 @@ CHANNEL_DB_REQUIRED = os.environ.get("CHANNEL_DB_REQUIRED", "0").strip().lower()
     "off",
 }
 CHANNEL_DB_SNAPSHOT_PREFIX = "zx_store_snapshot_"
+SELF_PING_URL = os.environ.get("SELF_PING_URL", "").strip()
+if not SELF_PING_URL:
+    _render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if _render_url:
+        SELF_PING_URL = f"{_render_url}/health"
 REMOVE_ADMIN_IDS = {
     int(part)
     for part in os.environ.get("REMOVE_ADMIN_IDS", "").replace(",", " ").split()
@@ -6102,6 +6108,16 @@ async def cb_admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 
+async def job_self_ping(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not SELF_PING_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.get(SELF_PING_URL)
+    except httpx.HTTPError:
+        pass
+
+
 async def job_expire_redeem_codes(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-deletes redeem codes past their expiry_date, along with their
     usage records, so admins never have to clean these up manually."""
@@ -6544,6 +6560,7 @@ async def post_init(app: Application) -> None:
         raise
     await init_db_pool()
     if app.job_queue:
+        app.job_queue.run_repeating(job_self_ping, interval=300, first=30)
         app.job_queue.run_repeating(job_expire_redeem_codes, interval=3600, first=15)
         app.job_queue.run_repeating(job_channel_db_flush, interval=60, first=60)
     log.info("Bot initialized and ready.")
