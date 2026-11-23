@@ -1222,7 +1222,7 @@ async def _init_db_schema() -> None:
                 timestamp TEXT
             );
 
-            -- New Buy catalogue: Bot Source Code and Method products.
+            -- New Buy catalogue: Source Code, Method, and Product items.
             CREATE TABLE IF NOT EXISTS products (
                 product_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT NOT NULL,
@@ -1301,6 +1301,25 @@ async def _init_db_schema() -> None:
             "INSERT OR IGNORE INTO admins (user_id, added_date) VALUES (?, ?)",
             (OWNER_ID, datetime.utcnow().isoformat()),
         )
+        cur = await db.execute("SELECT 1 FROM settings WHERE key='legacy_store_migrated'")
+        if not await cur.fetchone():
+            now = datetime.utcnow().isoformat()
+            await db.execute(
+                "INSERT INTO products (category, name, description, price, preview_file_id, "
+                "preview_file_unique_id, attachment_file_id, attachment_file_unique_id, "
+                "attachment_kind, attachment_name, attachment_size, storage_chat_id, storage_message_id, "
+                "is_active, is_deleted, created_at, updated_at) "
+                "SELECT 'product', f.file_name, COALESCE(f.description, ''), f.price, NULL, NULL, "
+                "f.tg_file_id, f.tg_file_unique_id, f.file_kind, f.file_name, f.file_size, NULL, NULL, "
+                "1, 0, COALESCE(f.upload_date, ?), COALESCE(f.upload_date, ?) "
+                "FROM files f WHERE f.is_deleted=0 "
+                "AND NOT EXISTS (SELECT 1 FROM products p WHERE p.category='product' "
+                "AND p.attachment_file_id=f.tg_file_id)",
+                (now, now),
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('legacy_store_migrated', '1')"
+            )
         await db.commit()
     log.info("Database ready at %s", DB_PATH)
 
@@ -1954,7 +1973,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = (
         "📖 <b>Help & Guide</b>\n\n"
-        "🛒 <b>Buy</b> — Browse Bot Source Code and Method products.\n"
+        "🛒 <b>Buy</b> — Browse Source Code, Method, and Product items.\n"
         "🪙 <b>Coins</b> — Buy coins by DMing @duifioookn2, "
         "or earn them via Referrals and Redeem Codes.\n"
         "👥 <b>Referral</b> — Share your personal link, earn coins per new user.\n"
@@ -2258,7 +2277,7 @@ async def cb_file_request_done(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         await context.bot.send_message(
             req["user_id"],
-            f"✅ <b>Your file request has been fulfilled!</b>\n\n📝 {html.escape(req['request_text'])}\n\nCheck -- Buy Files!",
+            f"✅ <b>Your file request has been fulfilled!</b>\n\n📝 {html.escape(req['request_text'])}\n\nCheck Buy → Product.",
             parse_mode=ParseMode.HTML,
         )
     except TelegramError:
@@ -2709,7 +2728,7 @@ async def handle_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 
-PRODUCT_CATEGORIES = {"bot": "Bot Source Code", "method": "Method"}
+PRODUCT_CATEGORIES = {"bot": "Source Code", "method": "Method", "product": "Product"}
 PRODUCTS_PER_PAGE = 8
 PRODUCT_LONG_NAME_THRESHOLD = 20
 
@@ -2773,10 +2792,11 @@ async def handle_buy_home(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "<b>Choose Option</b>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Bot Source Code", callback_data="buy:cat:bot:0", style="primary")],
-        [InlineKeyboardButton("Method", callback_data="buy:cat:method:0", style="primary")],
-        [InlineKeyboardButton("📂 Store", callback_data="buy:legacy", style="primary"),
+        [InlineKeyboardButton("Source Code", callback_data="buy:cat:bot:0", style="primary"),
+         InlineKeyboardButton("Method", callback_data="buy:cat:method:0", style="primary")],
+        [InlineKeyboardButton("Product", callback_data="buy:cat:product:0", style="primary"),
          InlineKeyboardButton("🗂 My Purchases", callback_data="purchases:0", style="primary")],
+        [InlineKeyboardButton("⬅ Back", callback_data="main:menu", style="primary")],
     ])
     if update.callback_query:
         await update.callback_query.answer()
@@ -2792,10 +2812,16 @@ async def cb_buy_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await handle_buy_home(update, context)
 
 
+async def cb_user_back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await show_main_menu(update, context)
+
+
 async def cb_buy_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    await send_file_list(update, context, page=0, edit=True)
+    await render_product_list(update, "product", 0)
 
 
 async def cb_buy_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2902,7 +2928,6 @@ async def _render_product_details(update: Update, product, category: str, page: 
     cat = product["category"]
     rows.append([
         InlineKeyboardButton("⬅ Back", callback_data=f"buy:cat:{cat}:{page}", style="primary"),
-        InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="primary"),
     ])
     kb = InlineKeyboardMarkup(rows)
 
@@ -3166,7 +3191,7 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬇ Redeliver", callback_data=f"buy:redeliver:{product_id}", style="success")],
-                    [InlineKeyboardButton("🛒 Buy Menu", callback_data="buy:home", style="primary")],
+                    [InlineKeyboardButton("⬅ Back", callback_data=f"buy:cat:{product['category']}:0", style="primary")],
                 ]),
             )
         except BadRequest:
@@ -3183,6 +3208,7 @@ async def cb_product_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬇ Retry Delivery", callback_data=f"buy:redeliver:{product_id}", style="success")],
                     [InlineKeyboardButton("💬 Support", callback_data="buy:support", style="primary")],
+                    [InlineKeyboardButton("⬅ Back", callback_data=f"buy:cat:{product['category']}:0", style="primary")],
                 ]),
             )
         except BadRequest:
@@ -3260,7 +3286,10 @@ async def send_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
 
     if not rows:
         text = "🛒 <b>Buy Files</b>\n\nNo files available right now."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 My Purchases", callback_data="purchases:0", style="primary")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛒 My Purchases", callback_data="purchases:0", style="primary")],
+            [InlineKeyboardButton("⬅ Back", callback_data="buy:home", style="primary")],
+        ])
     else:
         text = "🛒 <b>Buy Files</b>\n\nSelect a file to view details:"
         buttons = []
@@ -3275,6 +3304,7 @@ async def send_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
         if nav:
             buttons.append(nav)
         buttons.append([InlineKeyboardButton("🛒 My Purchases", callback_data="purchases:0", style="primary")])
+        buttons.append([InlineKeyboardButton("⬅ Back", callback_data="buy:home", style="primary")])
         kb = InlineKeyboardMarkup(buttons)
 
     if edit and update.callback_query:
@@ -3449,7 +3479,7 @@ async def cb_my_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not products and not files:
         lines.append("\nYou haven't purchased anything yet.")
 
-    buttons.append([InlineKeyboardButton("🏠 Buy Menu", callback_data="buy:home", style="primary")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="buy:home", style="primary")])
     text = "\n".join(lines)
     if len(text) > 3900:
         text = text[:3800] + "…"
@@ -3486,21 +3516,23 @@ async def cb_admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND is_active=1")
         active = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='bot'")
-        bots = (await cur.fetchone())[0]
+        source = (await cur.fetchone())[0]
         cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='method'")
         methods = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM products WHERE is_deleted=0 AND category='product'")
+        products_count = (await cur.fetchone())[0]
     text = (
         "🛒 <b>Product Manager</b>\n"
         f"{DIVIDER}\n"
-        f"🧩 Total Products: <b>{total}</b>\n"
+        f"🧩 Total: <b>{total}</b>\n"
         f"✅ Active: <b>{active}</b>\n"
-        f"🤖 Bot Source Code: <b>{bots}</b>\n"
-        f"📘 Methods: <b>{methods}</b>"
+        f"💻 Source Code: <b>{source}</b>\n"
+        f"📘 Method: <b>{methods}</b>\n"
+        f"📦 Product: <b>{products_count}</b>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Product", callback_data="pm:addsel", style="success")],
-        [InlineKeyboardButton("🤖 Bot Source Code", callback_data="pm:list:bot:0", style="primary")],
-        [InlineKeyboardButton("📘 Method", callback_data="pm:list:method:0", style="primary")],
+        [InlineKeyboardButton("🗂 Manage Products", callback_data="pm:manage:0", style="primary")],
         [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
     ])
     if update.callback_query:
@@ -3518,8 +3550,9 @@ async def cb_pm_add_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "➕ <b>Add Product</b>\n\n<b>Choose Product Category</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Method", callback_data="pm:add:method", style="primary")],
-            [InlineKeyboardButton("Bot Source Code", callback_data="pm:add:bot", style="primary")],
+            [InlineKeyboardButton("💻 Source Code", callback_data="pm:add:bot", style="primary")],
+            [InlineKeyboardButton("📘 Method", callback_data="pm:add:method", style="primary")],
+            [InlineKeyboardButton("📦 Product", callback_data="pm:add:product", style="primary")],
             [InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")],
         ]),
     )
@@ -3573,6 +3606,10 @@ async def conv_pm_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("❌ Name is too long (max 100 characters).")
         return PR_NAME
     draft["name"] = name
+    if draft.get("edit_field"):
+        draft.pop("edit_field", None)
+        await _pm_show_review(update.message, draft)
+        return PR_CONFIRM
     await update.message.reply_text(
         "Step 2/6 — Enter the <b>description / content</b> shown to users.\n"
         "Send - to skip.",
@@ -3588,6 +3625,10 @@ async def conv_pm_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
     text = update.message.text.strip()
     draft["description"] = "" if text in ("-", "") else text
+    if draft.get("edit_field"):
+        draft.pop("edit_field", None)
+        await _pm_show_review(update.message, draft)
+        return PR_CONFIRM
     await update.message.reply_text("Step 3/6 — Enter the <b>coin price</b> (0 = free):", parse_mode=ParseMode.HTML)
     return PR_PRICE
 
@@ -3602,6 +3643,10 @@ async def conv_pm_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Please enter a valid non-negative whole number.")
         return PR_PRICE
     draft["price"] = int(text)
+    if draft.get("edit_field"):
+        draft.pop("edit_field", None)
+        await _pm_show_review(update.message, draft)
+        return PR_CONFIRM
     await update.message.reply_text(
         "Step 4/6 — Send an optional <b>preview image</b>, or tap Skip.",
         parse_mode=ParseMode.HTML,
@@ -3624,6 +3669,10 @@ async def conv_pm_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     photo = update.message.photo[-1]
     draft["preview_file_id"] = photo.file_id
     draft["preview_file_unique_id"] = photo.file_unique_id
+    if draft.get("edit_field"):
+        draft.pop("edit_field", None)
+        await _pm_show_review(update.message, draft)
+        return PR_CONFIRM
     await update.message.reply_text(
         "Step 5/6 — Send the optional <b>product file/attachment</b>, or tap Skip.",
         parse_mode=ParseMode.HTML,
@@ -3688,6 +3737,10 @@ async def conv_pm_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 "\nFile fallback file_id se deliver hogi.")
     else:
         note = "\n\n📦 Channel me save ho gaya."
+    if draft.get("edit_field"):
+        draft.pop("edit_field", None)
+        await _pm_show_review(update.message, draft)
+        return PR_CONFIRM
     await update.message.reply_text(
         "Step 6/6 — Choose the product status:" + note,
         reply_markup=InlineKeyboardMarkup([
@@ -3702,9 +3755,14 @@ async def conv_pm_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def cb_pm_skip_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if not context.user_data.get("pm_draft"):
+    draft = context.user_data.get("pm_draft")
+    if not draft:
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    if draft.get("edit_field") == "preview":
+        draft.pop("edit_field", None)
+        await _pm_show_review(query.message, draft)
+        return PR_CONFIRM
     await query.message.reply_text(
         "Step 5/6 — Send the optional <b>product file/attachment</b>, or tap Skip.",
         parse_mode=ParseMode.HTML,
@@ -3719,9 +3777,14 @@ async def cb_pm_skip_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cb_pm_skip_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    if not context.user_data.get("pm_draft"):
+    draft = context.user_data.get("pm_draft")
+    if not draft:
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    if draft.get("edit_field") == "file":
+        draft.pop("edit_field", None)
+        await _pm_show_review(query.message, draft)
+        return PR_CONFIRM
     await query.message.reply_text(
         "Step 6/6 — Choose the product status:",
         reply_markup=InlineKeyboardMarkup([
@@ -3740,6 +3803,7 @@ async def cb_pm_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not draft:
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    draft.pop("edit_field", None)
     draft["is_active"] = 1 if query.data.endswith("active") else 0
     await _pm_show_review(query.message, draft)
     return PR_CONFIRM
@@ -3770,12 +3834,19 @@ async def _pm_show_review(message, draft: dict) -> None:
     await message.reply_text(_pm_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+def _pm_edit_skip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ Skip", callback_data="pm:skip:field", style="primary")],
+    ])
+
+
 async def cb_pm_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     if not context.user_data.get("pm_draft"):
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    context.user_data["pm_draft"].pop("edit_field", None)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🧩 Name", callback_data="pm:edit:name", style="primary"),
          InlineKeyboardButton("📝 Description", callback_data="pm:edit:desc", style="primary")],
@@ -3793,17 +3864,34 @@ async def cb_pm_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     field = query.data.split(":")[2]
-    if not context.user_data.get("pm_draft"):
+    draft = context.user_data.get("pm_draft")
+    if not draft:
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    draft["edit_field"] = field
     if field == "name":
-        await query.message.reply_text("📝 Enter the new product name:")
+        current = html.escape(draft.get("name") or "—")
+        await query.message.reply_text(
+            f"📝 Current name: <b>{current}</b>\n\nSend a new name, or tap Skip.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pm_edit_skip_kb(),
+        )
         return PR_NAME
     if field == "desc":
-        await query.message.reply_text("📝 Enter the new description (send - to clear):")
+        current = html.escape(draft.get("description") or "None")
+        await query.message.reply_text(
+            f"📝 Current description:\n<i>{current}</i>\n\nSend a new description, or tap Skip.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pm_edit_skip_kb(),
+        )
         return PR_DESC
     if field == "price":
-        await query.message.reply_text("🪙 Enter the new coin price (0 = free):")
+        await query.message.reply_text(
+            f"🪙 Current price: <b>{draft.get('price', 0)}</b> coins\n\n"
+            "Send a new price, or tap Skip.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pm_edit_skip_kb(),
+        )
         return PR_PRICE
     if field == "preview":
         await query.message.reply_text(
@@ -3824,6 +3912,7 @@ async def cb_pm_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return PR_FILE
     if field == "status":
+        draft.pop("edit_field", None)
         await query.message.reply_text(
             "📌 Choose the product status:",
             reply_markup=InlineKeyboardMarkup([
@@ -3836,11 +3925,24 @@ async def cb_pm_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return PR_CONFIRM
 
 
+async def cb_pm_skip_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    draft = context.user_data.get("pm_draft")
+    if not draft:
+        await query.message.reply_text("❌ Session expired. Please start again.")
+        return ConversationHandler.END
+    draft.pop("edit_field", None)
+    await _pm_show_review(query.message, draft)
+    return PR_CONFIRM
+
+
 async def cb_pm_remove_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     draft = context.user_data.get("pm_draft")
     if draft:
+        draft.pop("edit_field", None)
         draft["preview_file_id"] = None
         draft["preview_file_unique_id"] = None
     await _pm_show_review(query.message, draft) if draft else None
@@ -3852,6 +3954,7 @@ async def cb_pm_remove_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     draft = context.user_data.get("pm_draft")
     if draft:
+        draft.pop("edit_field", None)
         draft["attachment_file_id"] = None
         draft["attachment_file_unique_id"] = None
         draft["attachment_kind"] = None
@@ -3870,6 +3973,7 @@ async def cb_pm_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not draft:
         await query.message.reply_text("❌ Session expired. Please start again.")
         return ConversationHandler.END
+    draft.pop("edit_field", None)
     await _pm_show_review(query.message, draft)
     return PR_CONFIRM
 
@@ -3940,6 +4044,50 @@ async def cb_pm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
+async def cb_pm_manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = max(0, int(query.data.split(":")[2]))
+    except (IndexError, ValueError):
+        page = 0
+    per_page = 10
+    async with db_conn() as db:
+        db.row_factory = aiosqlite.Row
+        total = (await (await db.execute(
+            "SELECT COUNT(*) FROM products WHERE is_deleted=0"
+        )).fetchone())[0]
+        if total and page * per_page >= total:
+            page = max(0, (total - 1) // per_page)
+        rows = await (await db.execute(
+            "SELECT * FROM products WHERE is_deleted=0 ORDER BY product_id DESC LIMIT ? OFFSET ?",
+            (per_page, page * per_page),
+        )).fetchall()
+    text = f"🗂 <b>Manage Products</b>\n\nTotal: <b>{total}</b>\n\nSelect a product to manage:"
+    buttons = []
+    for r in rows:
+        status = "✅" if r["is_active"] else "⛔"
+        label = f"{status} #{r['product_id']} {_category_label(r['category'])} — {r['name']} — 🪙{r['price']}"
+        if len(label) > 64:
+            label = label[:61] + "…"
+        buttons.append([InlineKeyboardButton(
+            label, callback_data=f"pm:view:{r['product_id']}:{page}", style="primary",
+        )])
+    if not rows:
+        text += "\n\n<i>No products yet.</i>"
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"pm:manage:{page-1}", style="primary"))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"pm:manage:{page+1}", style="primary"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")])
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def cb_pm_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update):
         return
@@ -3994,7 +4142,9 @@ async def cb_pm_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     query = update.callback_query
     await query.answer()
     try:
-        pid = int(query.data.split(":")[2])
+        parts = query.data.split(":")
+        pid = int(parts[2])
+        page = max(0, int(parts[3])) if len(parts) > 3 else 0
     except (IndexError, ValueError):
         await query.answer("❌ Invalid product.", show_alert=True)
         return
@@ -4019,7 +4169,7 @@ async def cb_pm_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("📎 Attachment", callback_data=f"pm:ef:file:{pid}", style="primary"),
          InlineKeyboardButton("📌 Toggle Status", callback_data=f"pm:togglestatus:{pid}", style="primary")],
         [InlineKeyboardButton("🗑 Delete Product", callback_data=f"pm:del:{pid}", style="danger")],
-        [InlineKeyboardButton("⬅ Back", callback_data=f"pm:list:{product['category']}:0", style="primary")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"pm:manage:{page}", style="primary")],
     ])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -4149,7 +4299,9 @@ async def conv_pe_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Unknown field.")
         return ConversationHandler.END
     await _apply_product_update(pid, {column: value})
-    await update.message.reply_text("✅ Product updated.")
+    await update.message.reply_text(
+        "✅ Product updated.", reply_markup=_pm_product_back_kb(pid)
+    )
     return ConversationHandler.END
 
 
@@ -4180,6 +4332,12 @@ async def _apply_product_update(pid: int, fields: dict) -> bool:
     except aiosqlite.Error:
         log.exception("Product update failed for #%s", pid)
         return False
+
+
+def _pm_product_back_kb(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅ Back", callback_data=f"pm:view:{pid}", style="primary")],
+    ])
 
 
 async def cb_pe_preview_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4216,7 +4374,10 @@ async def conv_pe_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "preview_file_id": photo.file_id,
         "preview_file_unique_id": photo.file_unique_id,
     })
-    await update.message.reply_text("✅ Preview image updated." if ok else "❌ Failed to update image.")
+    await update.message.reply_text(
+        "✅ Preview image updated." if ok else "❌ Failed to update image.",
+        reply_markup=_pm_product_back_kb(pid),
+    )
     return ConversationHandler.END
 
 
@@ -4230,7 +4391,10 @@ async def cb_pe_remove_preview(update: Update, context: ContextTypes.DEFAULT_TYP
     ok = await _apply_product_update(pid, {
         "preview_file_id": None, "preview_file_unique_id": None,
     })
-    await query.message.reply_text("✅ Preview image removed." if ok else "❌ Failed to remove image.")
+    await query.message.reply_text(
+        "✅ Preview image removed." if ok else "❌ Failed to remove image.",
+        reply_markup=_pm_product_back_kb(pid),
+    )
     return ConversationHandler.END
 
 
@@ -4300,17 +4464,22 @@ async def conv_pe_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "storage_message_id": channel_msg_id,
     })
     if not ok:
-        await update.message.reply_text("❌ Failed to update attachment.")
+        await update.message.reply_text("❌ Failed to update attachment.", reply_markup=_pm_product_back_kb(pid))
     elif store_err == "not_configured":
         await update.message.reply_text(
-            "✅ Attachment updated (local).\n⚠️ Storage channel set nahi hai — Admin Panel → 📦 Storage Channel me set karo."
+            "✅ Attachment updated (local).\n⚠️ Storage channel set nahi hai — Admin Panel → 📦 Storage Channel me set karo.",
+            reply_markup=_pm_product_back_kb(pid),
         )
     elif store_err:
         await update.message.reply_text(
-            f"✅ Attachment updated (local).\n⚠️ Channel upload failed: {html.escape(store_err)}"
+            f"✅ Attachment updated (local).\n⚠️ Channel upload failed: {html.escape(store_err)}",
+            reply_markup=_pm_product_back_kb(pid),
         )
     else:
-        await update.message.reply_text("✅ Attachment updated and saved in storage channel.")
+        await update.message.reply_text(
+            "✅ Attachment updated and saved in storage channel.",
+            reply_markup=_pm_product_back_kb(pid),
+        )
     return ConversationHandler.END
 
 
@@ -4326,7 +4495,10 @@ async def cb_pe_remove_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "attachment_kind": None, "attachment_name": None, "attachment_size": 0,
         "storage_chat_id": None, "storage_message_id": None,
     })
-    await query.message.reply_text("✅ Attachment removed." if ok else "❌ Failed to remove attachment.")
+    await query.message.reply_text(
+        "✅ Attachment removed." if ok else "❌ Failed to remove attachment.",
+        reply_markup=_pm_product_back_kb(pid),
+    )
     return ConversationHandler.END
 
 
@@ -6264,6 +6436,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_file_download, pattern=r"^file:dl:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_my_purchases, pattern=r"^purchases:\d+$"))
 
+    app.add_handler(CallbackQueryHandler(cb_user_back_to_main, pattern="^main:menu$"))
     app.add_handler(CallbackQueryHandler(cb_buy_home, pattern="^buy:home$"))
     app.add_handler(CallbackQueryHandler(cb_buy_legacy, pattern="^buy:legacy$"))
     app.add_handler(CallbackQueryHandler(cb_buy_category, pattern=r"^buy:cat:\w+:\d+$"))
@@ -6303,8 +6476,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_admin_referrals, pattern="^ad:referrals$"))
 
     app.add_handler(CallbackQueryHandler(cb_pm_add_select, pattern="^pm:addsel$"))
-    app.add_handler(CallbackQueryHandler(cb_pm_list, pattern=r"^pm:list:(bot|method):\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_pm_view, pattern=r"^pm:view:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_pm_manage, pattern=r"^pm:manage:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_pm_list, pattern=r"^pm:list:(bot|method|product):\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_pm_view, pattern=r"^pm:view:\d+(?::\d+)?$"))
     app.add_handler(CallbackQueryHandler(cb_pm_toggle_status, pattern=r"^pm:togglestatus:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_pm_delete_prompt, pattern=r"^pm:del:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_pm_delete_confirm, pattern=r"^pm:delok:\d+$"))
@@ -6312,11 +6486,20 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(cb_eco_toggle, pattern=r"^eco:(refon|refoff|lbon|lboff)$"))
 
     product_add_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_pm_add_start, pattern=r"^pm:add:(bot|method)$")],
+        entry_points=[CallbackQueryHandler(cb_pm_add_start, pattern=r"^pm:add:(bot|method|product)$")],
         states={
-            PR_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_name)],
-            PR_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_desc)],
-            PR_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_price)],
+            PR_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_name),
+                CallbackQueryHandler(cb_pm_skip_field, pattern="^pm:skip:field$"),
+            ],
+            PR_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_desc),
+                CallbackQueryHandler(cb_pm_skip_field, pattern="^pm:skip:field$"),
+            ],
+            PR_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_pm_price),
+                CallbackQueryHandler(cb_pm_skip_field, pattern="^pm:skip:field$"),
+            ],
             PR_PREVIEW: [
                 MessageHandler(filters.PHOTO, conv_pm_preview),
                 CallbackQueryHandler(cb_pm_skip_preview, pattern="^pm:skip:preview$"),
