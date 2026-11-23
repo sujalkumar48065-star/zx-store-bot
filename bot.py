@@ -106,7 +106,7 @@ def _env_float(name: str, default: float) -> float:
 # be private, and the bot must be an administrator with "Post Messages" and
 # "Pin Messages" permissions.
 DATABASE_CHANNEL_ID = _env_int("DATABASE_CHANNEL_ID", 0)
-CHANNEL_DB_FLUSH_INTERVAL = max(1.0, _env_float("CHANNEL_DB_FLUSH_INTERVAL", 4.0))
+CHANNEL_DB_FLUSH_INTERVAL = max(1.0, _env_float("CHANNEL_DB_FLUSH_INTERVAL", 10.0))
 CHANNEL_DB_REQUIRED = os.environ.get("CHANNEL_DB_REQUIRED", "0").strip().lower() not in {
     "0",
     "false",
@@ -1440,15 +1440,26 @@ async def ensure_user(user_id: int, username: str | None, first_name: str | None
                        referred_by: int | None = None) -> bool:
     """Returns True if this is a newly created user."""
     async with db_conn() as db:
-        cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-        exists = await cur.fetchone()
+        cur = await db.execute(
+            "SELECT username, first_name, last_seen FROM users WHERE user_id=?", (user_id,)
+        )
+        row = await cur.fetchone()
+        exists = row is not None
         now = datetime.utcnow().isoformat()
         if exists:
-            await db.execute(
-                "UPDATE users SET username=?, first_name=?, last_seen=? WHERE user_id=?",
-                (username, first_name, now, user_id),
-            )
-            await db.commit()
+            changed = row[0] != username or row[1] != first_name
+            stale = True
+            if row[2]:
+                try:
+                    stale = (datetime.utcnow() - datetime.fromisoformat(row[2])).total_seconds() >= 300
+                except ValueError:
+                    stale = True
+            if changed or stale:
+                await db.execute(
+                    "UPDATE users SET username=?, first_name=?, last_seen=? WHERE user_id=?",
+                    (username, first_name, now, user_id),
+                )
+                await db.commit()
             return False
         await db.execute(
             "INSERT INTO users (user_id, username, first_name, join_date, referred_by, last_seen) "
@@ -1619,19 +1630,38 @@ async def list_force_channels():
         return await cur.fetchall()
 
 
-async def check_force_join(bot, user_id: int) -> list[dict]:
-    """Returns list of channels the user has NOT joined."""
+_FORCE_JOIN_CACHE_TTL = 60.0
+_force_join_cache: dict[int, tuple[float, list[dict]]] = {}
+
+
+async def check_force_join(bot, user_id: int, force_refresh: bool = False) -> list[dict]:
+    """Returns channels the user has NOT joined, cached briefly so every
+    button tap doesn't make a fresh Telegram API call for each channel."""
     if (await get_setting("force_join", "1")) != "1":
         return []
+    now = time.monotonic()
+    if not force_refresh:
+        cached = _force_join_cache.get(user_id)
+        if cached and cached[0] > now:
+            return cached[1]
     channels = await list_force_channels()
-    missing = []
-    for ch in channels:
+
+    async def _check(ch):
         try:
             member = await bot.get_chat_member(chat_id=ch["chat_id"], user_id=user_id)
             if member.status in ("left", "kicked"):
-                missing.append(dict(ch))
+                return dict(ch)
         except TelegramError:
-            missing.append(dict(ch))
+            return dict(ch)
+        return None
+
+    results = await asyncio.gather(*(_check(ch) for ch in channels))
+    missing = [item for item in results if item is not None]
+    if len(_force_join_cache) > 5000:
+        for key, (expires, _) in list(_force_join_cache.items()):
+            if expires <= now:
+                _force_join_cache.pop(key, None)
+    _force_join_cache[user_id] = (now + _FORCE_JOIN_CACHE_TTL, missing)
     return missing
 
 
@@ -1953,7 +1983,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cb_verify_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
-    missing = await check_force_join(context.bot, user.id)
+    missing = await check_force_join(context.bot, user.id, force_refresh=True)
     if missing:
         await query.answer("❌ You haven't joined all channels yet.", show_alert=True)
         return
@@ -3531,8 +3561,8 @@ async def cb_admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"📦 Product: <b>{products_count}</b>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Product", callback_data="pm:addsel", style="success")],
-        [InlineKeyboardButton("🗂 Manage Products", callback_data="pm:manage:0", style="primary")],
+        [InlineKeyboardButton("📤 Upload", callback_data="pm:addsel", style="success")],
+        [InlineKeyboardButton("🗂 Manage", callback_data="pm:manage:0", style="primary")],
         [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
     ])
     if update.callback_query:
@@ -3547,13 +3577,13 @@ async def cb_pm_add_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "➕ <b>Add Product</b>\n\n<b>Choose Product Category</b>",
+        "📤 <b>Upload Product</b>\n\n<b>Choose a category</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💻 Source Code", callback_data="pm:add:bot", style="primary")],
             [InlineKeyboardButton("📘 Method", callback_data="pm:add:method", style="primary")],
             [InlineKeyboardButton("📦 Product", callback_data="pm:add:product", style="primary")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")],
+            [InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")],
         ]),
     )
     return ConversationHandler.END
@@ -4049,44 +4079,32 @@ async def cb_pm_manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     query = update.callback_query
     await query.answer()
-    try:
-        page = max(0, int(query.data.split(":")[2]))
-    except (IndexError, ValueError):
-        page = 0
-    per_page = 10
     async with db_conn() as db:
-        db.row_factory = aiosqlite.Row
-        total = (await (await db.execute(
-            "SELECT COUNT(*) FROM products WHERE is_deleted=0"
-        )).fetchone())[0]
-        if total and page * per_page >= total:
-            page = max(0, (total - 1) // per_page)
         rows = await (await db.execute(
-            "SELECT * FROM products WHERE is_deleted=0 ORDER BY product_id DESC LIMIT ? OFFSET ?",
-            (per_page, page * per_page),
+            "SELECT category, COUNT(*) FROM products WHERE is_deleted=0 GROUP BY category"
         )).fetchall()
-    text = f"🗂 <b>Manage Products</b>\n\nTotal: <b>{total}</b>\n\nSelect a product to manage:"
-    buttons = []
-    for r in rows:
-        status = "✅" if r["is_active"] else "⛔"
-        label = f"{status} #{r['product_id']} {_category_label(r['category'])} — {r['name']} — 🪙{r['price']}"
-        if len(label) > 64:
-            label = label[:61] + "…"
-        buttons.append([InlineKeyboardButton(
-            label, callback_data=f"pm:view:{r['product_id']}:{page}", style="primary",
-        )])
-    if not rows:
-        text += "\n\n<i>No products yet.</i>"
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"pm:manage:{page-1}", style="primary"))
-    if (page + 1) * per_page < total:
-        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"pm:manage:{page+1}", style="primary"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")])
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
-
+    counts = {r[0]: r[1] for r in rows}
+    text = (
+        "🗂 <b>Manage Products</b>\n"
+        f"{DIVIDER}\n\n"
+        "<b>Choose a category</b>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💻 Source Code ({counts.get('bot', 0)})",
+            callback_data="pm:list:bot:0", style="primary",
+        )],
+        [InlineKeyboardButton(
+            f"📘 Method ({counts.get('method', 0)})",
+            callback_data="pm:list:method:0", style="primary",
+        )],
+        [InlineKeyboardButton(
+            f"📦 Product ({counts.get('product', 0)})",
+            callback_data="pm:list:product:0", style="primary",
+        )],
+        [InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")],
+    ])
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def cb_pm_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update):
@@ -4132,7 +4150,7 @@ async def cb_pm_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         nav.append(InlineKeyboardButton("Next ➡", callback_data=f"pm:list:{category}:{page+1}", style="primary"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="ad:products", style="primary")])
+    buttons.append([InlineKeyboardButton("⬅ Back", callback_data="pm:manage:0", style="primary")])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -4169,7 +4187,7 @@ async def cb_pm_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("📎 Attachment", callback_data=f"pm:ef:file:{pid}", style="primary"),
          InlineKeyboardButton("📌 Toggle Status", callback_data=f"pm:togglestatus:{pid}", style="primary")],
         [InlineKeyboardButton("🗑 Delete Product", callback_data=f"pm:del:{pid}", style="danger")],
-        [InlineKeyboardButton("⬅ Back", callback_data=f"pm:manage:{page}", style="primary")],
+        [InlineKeyboardButton("⬅ Back", callback_data=f"pm:list:{product['category']}:{page}", style="primary")],
     ])
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
