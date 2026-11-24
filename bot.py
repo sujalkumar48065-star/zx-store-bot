@@ -1253,6 +1253,7 @@ async def _init_db_schema() -> None:
                 attachment_size INTEGER DEFAULT 0,
                 storage_chat_id INTEGER,
                 storage_message_id INTEGER,
+                attachments_json TEXT DEFAULT '[]',
                 is_active INTEGER DEFAULT 1,
                 is_deleted INTEGER DEFAULT 0,
                 created_at TEXT,
@@ -1299,6 +1300,7 @@ async def _init_db_schema() -> None:
             ("files", "featured", "INTEGER DEFAULT 0"),
             ("products", "storage_chat_id", "INTEGER"),
             ("products", "storage_message_id", "INTEGER"),
+            ("products", "attachments_json", "TEXT DEFAULT '[]'"),
         ]
         for table, column, coltype in migrations:
             try:
@@ -2778,6 +2780,218 @@ def _category_label(category: str) -> str:
     return PRODUCT_CATEGORIES.get(category, category)
 
 
+ATTACHMENT_KIND_LABELS = {
+    "document": "📄 File", "photo": "🖼 Image", "video": "🎬 Video",
+    "audio": "🎵 Audio", "voice": "🎙 Voice", "animation": "🎞 GIF",
+    "video_note": "⚪ Video Note", "sticker": "💟 Sticker",
+    "text": "📝 Text", "poll": "📊 Poll", "copy": "📦 Message",
+}
+
+
+def _product_attachments(product) -> list[dict]:
+    """Return all stored attachments, with backward compatibility for old rows."""
+    raw = _row_get(product, "attachments_json")
+    try:
+        items = json.loads(raw or "[]")
+        if isinstance(items, list):
+            items = [item for item in items if isinstance(item, dict)]
+            if items:
+                return items
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    file_id = _row_get(product, "attachment_file_id")
+    if not file_id:
+        return []
+    return [{
+        "kind": _row_get(product, "attachment_kind") or "document",
+        "file_id": file_id,
+        "file_unique_id": _row_get(product, "attachment_file_unique_id"),
+        "name": _row_get(product, "attachment_name") or "attachment",
+        "size": int(_row_get(product, "attachment_size") or 0),
+        "storage_chat_id": _row_get(product, "storage_chat_id"),
+        "storage_message_id": _row_get(product, "storage_message_id"),
+    }]
+
+
+def _attachment_summary(items: list[dict]) -> str:
+    counts: dict[str, int] = {}
+    total_size = 0
+    for item in items:
+        kind = str(item.get("kind") or "copy")
+        counts[kind] = counts.get(kind, 0) + 1
+        total_size += int(item.get("size") or 0)
+    lines = [f"📦 <b>Total items:</b> {len(items)}"]
+    detail = " • ".join(
+        f"{ATTACHMENT_KIND_LABELS.get(kind, kind)} {count}"
+        for kind, count in sorted(counts.items())
+    )
+    if detail:
+        lines.append(f"<b>Types:</b> {detail}")
+    lines.append(f"<b>Total size:</b> {fmt_size(total_size) if total_size else '0 B'}")
+    return "\n".join(lines)
+
+
+def _draft_attachment_fields(draft: dict) -> list[dict]:
+    items = draft.get("attachments")
+    return items if isinstance(items, list) else []
+
+
+def _write_legacy_attachment_fields(draft: dict) -> None:
+    items = _draft_attachment_fields(draft)
+    first = items[0] if items else {}
+    draft["attachment_file_id"] = first.get("file_id")
+    draft["attachment_file_unique_id"] = first.get("file_unique_id")
+    draft["attachment_kind"] = first.get("kind")
+    draft["attachment_name"] = first.get("name")
+    draft["attachment_size"] = int(first.get("size") or 0)
+    draft["storage_chat_id"] = first.get("storage_chat_id")
+    draft["storage_message_id"] = first.get("storage_message_id")
+
+
+def _message_attachment(msg, chat_id: int) -> dict | None:
+    """Convert any admin message into a storable attachment descriptor."""
+    base = {
+        "source_chat_id": chat_id,
+        "source_message_id": msg.message_id,
+        "kind": "copy",
+        "name": "message",
+        "size": 0,
+    }
+    if msg.text:
+        return {**base, "kind": "text", "text": msg.text, "name": "text"}
+    if msg.poll:
+        poll = msg.poll
+        return {
+            **base, "kind": "poll", "name": "poll",
+            "poll": {
+                "question": poll.question,
+                "options": [option.text for option in poll.options],
+                "is_anonymous": poll.is_anonymous,
+                "type": str(getattr(poll, "type", "regular")),
+                "allows_multiple_answers": poll.allows_multiple_answers,
+                "correct_option_id": poll.correct_option_id,
+                "explanation": poll.explanation,
+            },
+        }
+    file_obj = None
+    kind = None
+    name = None
+    if msg.document:
+        file_obj, kind, name = msg.document, "document", msg.document.file_name or "file"
+    elif msg.video:
+        file_obj, kind, name = msg.video, "video", msg.video.file_name or "video.mp4"
+    elif msg.audio:
+        file_obj, kind, name = msg.audio, "audio", msg.audio.file_name or "audio.mp3"
+    elif msg.voice:
+        file_obj, kind, name = msg.voice, "voice", "voice.ogg"
+    elif msg.animation:
+        file_obj, kind, name = msg.animation, "animation", msg.animation.file_name or "animation.gif"
+    elif msg.video_note:
+        file_obj, kind, name = msg.video_note, "video_note", "video_note.mp4"
+    elif msg.sticker:
+        file_obj, kind = msg.sticker, "sticker"
+        name = "sticker." + (msg.sticker.file_name.rsplit(".", 1)[-1] if msg.sticker.file_name and "." in msg.sticker.file_name else "webp")
+    elif msg.photo:
+        file_obj, kind = msg.photo[-1], "photo"
+        name = f"photo_{file_obj.file_unique_id}.jpg"
+    if file_obj is not None:
+        return {
+            **base, "kind": kind, "file_id": file_obj.file_id,
+            "file_unique_id": file_obj.file_unique_id,
+            "name": name, "size": int(file_obj.file_size or 0),
+        }
+    return base
+
+
+async def _copy_attachment_to_storage(bot, item: dict, label: str) -> None:
+    """Copy one attachment into the storage channel and remember its ids."""
+    if item.get("storage_chat_id") and item.get("storage_message_id"):
+        return
+    source_chat_id = item.get("source_chat_id")
+    source_message_id = item.get("source_message_id")
+    if not source_chat_id or not source_message_id:
+        return
+    channel_id = await get_storage_channel_id()
+    if not channel_id:
+        return
+    try:
+        sent = await bot.copy_message(
+            chat_id=channel_id, from_chat_id=int(source_chat_id),
+            message_id=int(source_message_id),
+        )
+    except TelegramError as exc:
+        log.warning("Attachment channel copy failed (%s): %s", label, exc)
+        return
+    item["storage_chat_id"] = channel_id
+    item["storage_message_id"] = sent.message_id
+
+
+async def _prepare_attachments_for_save(bot, draft: dict) -> list[dict]:
+    items = _draft_attachment_fields(draft)
+    for item in items:
+        await _copy_attachment_to_storage(bot, item, draft.get("name") or "product")
+    _write_legacy_attachment_fields(draft)
+    return items
+
+
+async def _send_attachment_item(bot, chat_id: int, item: dict, product_name: str = "") -> bool:
+    """Deliver one stored attachment, falling back when channel copy is unavailable."""
+    channel_id = item.get("storage_chat_id")
+    message_id = item.get("storage_message_id")
+    if channel_id and message_id:
+        try:
+            await bot.copy_message(chat_id=chat_id, from_chat_id=int(channel_id), message_id=int(message_id))
+            return True
+        except TelegramError as exc:
+            log.warning("Attachment copy failed, using fallback: %s", exc)
+    kind = str(item.get("kind") or "copy").lower()
+    try:
+        if kind == "text" and item.get("text"):
+            await bot.send_message(chat_id, item["text"])
+            return True
+        if kind == "poll" and item.get("poll"):
+            p = item["poll"]
+            await bot.send_poll(
+                chat_id=chat_id, question=p.get("question") or "Poll",
+                options=p.get("options") or [], is_anonymous=bool(p.get("is_anonymous", True)),
+                type=p.get("type") or "regular",
+                allows_multiple_answers=bool(p.get("allows_multiple_answers", False)),
+                correct_option_id=p.get("correct_option_id"),
+                explanation=p.get("explanation"),
+            )
+            return True
+        file_id = item.get("file_id")
+        if not file_id:
+            source_chat_id = item.get("source_chat_id")
+            source_message_id = item.get("source_message_id")
+            if source_chat_id and source_message_id:
+                await bot.copy_message(chat_id=chat_id, from_chat_id=int(source_chat_id), message_id=int(source_message_id))
+                return True
+            return False
+        caption = f"🧩 {html.escape(product_name)}" if product_name else None
+        kwargs = {"chat_id": chat_id, "caption": caption, "parse_mode": ParseMode.HTML} if caption else {"chat_id": chat_id}
+        if kind == "photo":
+            await bot.send_photo(photo=file_id, **kwargs)
+        elif kind == "video":
+            await bot.send_video(video=file_id, **kwargs)
+        elif kind == "audio":
+            await bot.send_audio(audio=file_id, **kwargs)
+        elif kind == "voice":
+            await bot.send_voice(voice=file_id, **kwargs)
+        elif kind == "animation":
+            await bot.send_animation(animation=file_id, **kwargs)
+        elif kind == "video_note":
+            await bot.send_video_note(video_note=file_id)
+        elif kind == "sticker":
+            await bot.send_sticker(sticker=file_id)
+        else:
+            await bot.send_document(document=file_id, **kwargs)
+        return True
+    except TelegramError as exc:
+        log.warning("Attachment fallback failed (%s): %s", kind, exc)
+        return False
+
+
 async def _get_product(product_id: int, include_deleted: bool = False):
     async with db_conn() as db:
         db.row_factory = aiosqlite.Row
@@ -3114,21 +3328,30 @@ async def deliver_product(bot, user_id: int, product, purchase_id: int | None = 
             delivered_any = True
         except TelegramError as exc:
             errors.append(f"text: {exc}")
-    attachment_file_id = _row_get(product, "attachment_file_id")
-    if _row_get(product, "storage_message_id") or attachment_file_id:
-        copied = await copy_stored_product(bot, user_id, product)
-        if copied:
-            delivered_any = True
-        elif attachment_file_id:
-            # Channel message may have been deleted — fall back to the file_id
-            # captured when the product was created.
-            try:
-                await _send_product_attachment(bot, user_id, product)
+    attachments = _product_attachments(product)
+    if attachments:
+        for index, item in enumerate(attachments, start=1):
+            sent = await _send_attachment_item(
+                bot, user_id, item, product["name"] or ""
+            )
+            if sent:
                 delivered_any = True
-            except TelegramError as exc:
-                errors.append(f"file: {exc}")
-        else:
-            errors.append("file: stored channel message unavailable and no fallback file")
+            else:
+                errors.append(f"attachment {index}")
+    else:
+        attachment_file_id = _row_get(product, "attachment_file_id")
+        if _row_get(product, "storage_message_id") or attachment_file_id:
+            copied = await copy_stored_product(bot, user_id, product)
+            if copied:
+                delivered_any = True
+            elif attachment_file_id:
+                try:
+                    await _send_product_attachment(bot, user_id, product)
+                    delivered_any = True
+                except TelegramError as exc:
+                    errors.append(f"file: {exc}")
+            else:
+                errors.append("file: stored channel message unavailable and no fallback file")
 
     if delivered_any and not errors:
         if purchase_id is not None:
@@ -3656,6 +3879,7 @@ async def cb_pm_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "attachment_size": 0,
         "storage_chat_id": None,
         "storage_message_id": None,
+        "attachments": [],
         "is_active": 1,
     }
     await query.message.reply_text(
@@ -3746,15 +3970,183 @@ async def conv_pm_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         draft.pop("edit_field", None)
         await _pm_show_review(update.message, draft)
         return PR_CONFIRM
-    await update.message.reply_text(
-        "Step 5/6 — Send the optional <b>product file/attachment</b>, or tap Skip.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ Skip File", callback_data="pm:skip:file", style="primary")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")],
-        ]),
-    )
+    await _show_attachment_collector(update.message, draft)
     return PR_FILE
+
+
+def _attachment_collector_kb(draft: dict) -> InlineKeyboardMarkup:
+    items = _draft_attachment_fields(draft)
+    rows = []
+    if items:
+        rows.append([InlineKeyboardButton("✅ Publish Active", callback_data="pm:att:publish:active", style="success")])
+        rows.append([InlineKeyboardButton("📌 Publish Inactive", callback_data="pm:att:publish:inactive", style="primary")])
+        rows.append([InlineKeyboardButton("🗑 Clear All", callback_data="pm:att:clear", style="danger")])
+    else:
+        rows.append([InlineKeyboardButton("⏭ Skip Attachments", callback_data="pm:skip:file", style="primary")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _attachment_collector_text(draft: dict) -> str:
+    items = _draft_attachment_fields(draft)
+    if draft.get("edit_pid"):
+        header = "📎 <b>Update Attachments</b>"
+    else:
+        header = "Step 5/6 — <b>Send Attachments</b>"
+    lines = [
+        header,
+        "Send any type one by one: file, image, video, text, sticker, GIF, voice, poll, etc.",
+        "Every new item is added to this product. Tap Publish when finished.",
+        "",
+        _attachment_summary(items),
+    ]
+    return "\n".join(lines)
+
+
+async def _show_attachment_collector(message, draft: dict) -> None:
+    sent = await message.reply_text(
+        _attachment_collector_text(draft),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_attachment_collector_kb(draft),
+    )
+    draft["att_chat_id"] = sent.chat_id
+    draft["att_message_id"] = sent.message_id
+
+
+async def _refresh_attachment_collector(bot, draft: dict) -> None:
+    chat_id = draft.get("att_chat_id")
+    message_id = draft.get("att_message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=int(chat_id), message_id=int(message_id),
+            text=_attachment_collector_text(draft), parse_mode=ParseMode.HTML,
+            reply_markup=_attachment_collector_kb(draft),
+        )
+    except TelegramError as exc:
+        log.warning("Could not refresh attachment collector: %s", exc)
+
+
+async def conv_pm_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get("pm_draft")
+    if not draft:
+        await update.message.reply_text("❌ Session expired. Please start again.")
+        return ConversationHandler.END
+    item = _message_attachment(update.message, update.effective_chat.id)
+    if item is None:
+        await update.message.reply_text("❌ Could not read this message. Send another attachment.")
+        return PR_FILE
+    items = draft.setdefault("attachments", [])
+    items.append(item)
+    _write_legacy_attachment_fields(draft)
+    await _refresh_attachment_collector(context.bot, draft)
+    return PR_FILE
+
+
+async def cb_pm_att_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    draft = context.user_data.get("pm_draft")
+    if not draft:
+        await query.message.reply_text("❌ Session expired. Please start again.")
+        return ConversationHandler.END
+    draft["attachments"] = []
+    draft["att_chat_id"] = query.message.chat_id
+    draft["att_message_id"] = query.message.message_id
+    _write_legacy_attachment_fields(draft)
+    await _refresh_attachment_collector(context.bot, draft)
+    return PR_FILE
+
+
+async def _persist_draft_product(update: Update, context: ContextTypes.DEFAULT_TYPE, draft: dict) -> int:
+    query = update.callback_query
+    items = await _prepare_attachments_for_save(context.bot, draft)
+    serialized = json.dumps(items, ensure_ascii=False)
+    now = datetime.utcnow().isoformat()
+    pid = draft.get("edit_pid")
+    try:
+        async with db_conn() as db:
+            if pid:
+                await db.execute(
+                    "UPDATE products SET category=?, name=?, description=?, price=?, "
+                    "preview_file_id=?, preview_file_unique_id=?, attachment_file_id=?, "
+                    "attachment_file_unique_id=?, attachment_kind=?, attachment_name=?, "
+                    "attachment_size=?, storage_chat_id=?, storage_message_id=?, "
+                    "attachments_json=?, is_active=?, updated_at=? WHERE product_id=?",
+                    (
+                        draft["category"], draft["name"], draft["description"], draft["price"],
+                        draft["preview_file_id"], draft["preview_file_unique_id"],
+                        draft.get("attachment_file_id"), draft.get("attachment_file_unique_id"),
+                        draft.get("attachment_kind"), draft.get("attachment_name"),
+                        int(draft.get("attachment_size") or 0),
+                        draft.get("storage_chat_id"), draft.get("storage_message_id"),
+                        serialized, int(draft.get("is_active", 1) or 0), now, int(pid),
+                    ),
+                )
+            else:
+                await db.execute(
+                    "INSERT INTO products (category, name, description, price, preview_file_id, "
+                    "preview_file_unique_id, attachment_file_id, attachment_file_unique_id, "
+                    "attachment_kind, attachment_name, attachment_size, storage_chat_id, storage_message_id, "
+                    "attachments_json, is_active, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        draft["category"], draft["name"], draft["description"], draft["price"],
+                        draft["preview_file_id"], draft["preview_file_unique_id"],
+                        draft.get("attachment_file_id"), draft.get("attachment_file_unique_id"),
+                        draft.get("attachment_kind"), draft.get("attachment_name"),
+                        int(draft.get("attachment_size") or 0),
+                        draft.get("storage_chat_id"), draft.get("storage_message_id"),
+                        serialized, int(draft.get("is_active", 1) or 0), now, now,
+                    ),
+                )
+            await db.commit()
+            if pid:
+                saved_pid = int(pid)
+            else:
+                cur = await db.execute("SELECT last_insert_rowid()")
+                saved_pid = (await cur.fetchone())[0]
+    except aiosqlite.Error as exc:
+        log.exception("Failed to save product")
+        if query:
+            await query.answer("❌ Failed to save product.", show_alert=True)
+        await update.effective_message.reply_text(
+            f"❌ <b>Save failed:</b> {html.escape(str(exc))}", parse_mode=ParseMode.HTML
+        )
+        return PR_CONFIRM
+
+    context.user_data.pop("pm_draft", None)
+    if query:
+        await query.answer("✅ Saved")
+    action = "Updated" if pid else "Added"
+    await update.effective_message.reply_text(
+        f"✅ <b>Product {action}!</b>\n\n🆔 ID: <code>{saved_pid}</code>\n"
+        f"🧩 {html.escape(draft['name'])}\n"
+        f"📂 {_category_label(draft['category'])}\n"
+        f"📎 Attachments: <b>{len(items)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    await log_admin_action(
+        context.bot, update.effective_user.id,
+        f"🛒 {action} product #{saved_pid} ({draft['category']}): {html.escape(draft['name'])}",
+    )
+    return ConversationHandler.END
+
+
+async def cb_pm_att_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get("pm_draft")
+    if not draft:
+        await update.callback_query.answer("⚠️ Session expired.", show_alert=True)
+        return ConversationHandler.END
+    if not await require_admin(update):
+        return ConversationHandler.END
+    items = _draft_attachment_fields(draft)
+    if not items and not draft.get("description") and not draft.get("attachment_file_id"):
+        await update.callback_query.answer("❌ Send at least one attachment first.", show_alert=True)
+        return PR_FILE
+    draft["is_active"] = 1 if update.callback_query.data.endswith("active") else 0
+    return await _persist_draft_product(update, context, draft)
 
 
 async def conv_pm_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3836,14 +4228,7 @@ async def cb_pm_skip_preview(update: Update, context: ContextTypes.DEFAULT_TYPE)
         draft.pop("edit_field", None)
         await _pm_show_review(query.message, draft)
         return PR_CONFIRM
-    await query.message.reply_text(
-        "Step 5/6 — Send the optional <b>product file/attachment</b>, or tap Skip.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ Skip File", callback_data="pm:skip:file", style="primary")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")],
-        ]),
-    )
+    await _show_attachment_collector(query.message, draft)
     return PR_FILE
 
 
@@ -3883,6 +4268,13 @@ async def cb_pm_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 def _pm_review_text(draft: dict) -> str:
+    attachments = draft.get("attachments")
+    if attachments is None:
+        attachments = _product_attachments(draft) if draft.get("attachment_file_id") else []
+    if attachments:
+        attachment_line = f"📎 Attachments: <b>{len(attachments)}</b> ({fmt_size(sum(int(i.get('size') or 0) for i in attachments))})"
+    else:
+        attachment_line = "📎 Attachments: ❌ None"
     return (
         "🧾 <b>Review Product</b>\n"
         f"{DIVIDER}\n"
@@ -3890,8 +4282,8 @@ def _pm_review_text(draft: dict) -> str:
         f"🧩 Name: <b>{html.escape(draft['name'])}</b>\n"
         f"🪙 Price: <b>{draft['price']}</b>\n"
         f"🖼 Preview Image: {'✅ Yes' if draft['preview_file_id'] else '❌ None'}\n"
-        f"📎 Attachment: {'✅ ' + html.escape(str(draft['attachment_name'])) if draft['attachment_file_id'] else '❌ None'}\n"
-        f"📦 Channel copy: {'✅ Saved' if draft.get('storage_message_id') else '❌ Not saved'}\n"
+        f"{attachment_line}\n"
+        f"📦 Channel copy: {'✅ Saved' if any(i.get('storage_message_id') for i in attachments) else '❌ Not saved'}\n"
         f"📌 Status: {'✅ Active' if draft['is_active'] else '⛔ Inactive'}\n"
         f"{DIVIDER}\n"
         f"📝 Description:\n{html.escape(draft['description']) if draft['description'] else '<i>None</i>'}"
@@ -3976,13 +4368,7 @@ async def cb_pm_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return PR_PREVIEW
     if field == "file":
-        await query.message.reply_text(
-            "📎 Send a new attachment, or choose an option:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Skip", callback_data="pm:skip:file", style="primary")],
-                [InlineKeyboardButton("🗑 Remove File", callback_data="pm:edit:rmfile", style="danger")],
-            ]),
-        )
+        await _show_attachment_collector(query.message, draft)
         return PR_FILE
     if field == "status":
         draft.pop("edit_field", None)
@@ -4062,48 +4448,10 @@ async def cb_pm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not draft.get("name"):
         await query.answer("❌ Product name missing.", show_alert=True)
         return PR_CONFIRM
-    if not draft.get("description") and not draft.get("attachment_file_id"):
+    if not draft.get("description") and not _draft_attachment_fields(draft) and not draft.get("attachment_file_id"):
         await query.answer("❌ Add a description or an attachment first.", show_alert=True)
         return PR_CONFIRM
-    now = datetime.utcnow().isoformat()
-    try:
-        async with db_conn() as db:
-            await db.execute(
-                "INSERT INTO products (category, name, description, price, preview_file_id, "
-                "preview_file_unique_id, attachment_file_id, attachment_file_unique_id, "
-                "attachment_kind, attachment_name, attachment_size, storage_chat_id, storage_message_id, "
-                "is_active, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    draft["category"], draft["name"], draft["description"], draft["price"],
-                    draft["preview_file_id"], draft["preview_file_unique_id"],
-                    draft["attachment_file_id"], draft["attachment_file_unique_id"],
-                    draft["attachment_kind"], draft["attachment_name"], draft["attachment_size"],
-                    draft.get("storage_chat_id"), draft.get("storage_message_id"),
-                    draft["is_active"], now, now,
-                ),
-            )
-            await db.commit()
-            cur = await db.execute("SELECT last_insert_rowid()")
-            pid = (await cur.fetchone())[0]
-    except aiosqlite.Error as exc:
-        log.exception("Failed to save product")
-        await query.answer("❌ Failed to save product.", show_alert=True)
-        await query.message.reply_text(f"❌ <b>Save failed:</b> {html.escape(str(exc))}", parse_mode=ParseMode.HTML)
-        return PR_CONFIRM
-    context.user_data.pop("pm_draft", None)
-    await query.answer("✅ Product saved")
-    await query.message.reply_text(
-        f"✅ <b>Product Saved!</b>\n\n🆔 ID: <code>{pid}</code>\n"
-        f"🧩 {html.escape(draft['name'])}\n"
-        f"📂 {_category_label(draft['category'])}",
-        parse_mode=ParseMode.HTML,
-    )
-    await log_admin_action(
-        context.bot, update.effective_user.id,
-        f"🛒 Added product #{pid} ({draft['category']}): {html.escape(draft['name'])}",
-    )
-    return ConversationHandler.END
+    return await _persist_draft_product(update, context, draft)
 
 
 async def cb_pm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4193,6 +4541,7 @@ async def cb_pm_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "preview_file_id": product["preview_file_id"],
         "attachment_file_id": product["attachment_file_id"],
         "attachment_name": product["attachment_name"],
+        "attachments": _product_attachments(product),
         "is_active": product["is_active"],
     })
     text += f"\n\n🆔 Product ID: <code>{product['product_id']}</code>"
@@ -4346,7 +4695,8 @@ async def _apply_product_update(pid: int, fields: dict) -> bool:
     allowed = {
         "name", "description", "price", "preview_file_id", "preview_file_unique_id",
         "attachment_file_id", "attachment_file_unique_id", "attachment_kind",
-        "attachment_name", "attachment_size", "storage_chat_id", "storage_message_id", "is_active",
+        "attachment_name", "attachment_size", "storage_chat_id", "storage_message_id",
+        "attachments_json", "is_active",
     }
     sets, values = [], []
     for key, val in fields.items():
@@ -4442,15 +4792,22 @@ async def cb_pe_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pid = int(query.data.split(":")[3])
     except (IndexError, ValueError):
         return ConversationHandler.END
-    context.user_data["pe_pid"] = pid
-    await query.message.reply_text(
-        "📎 Send the new attachment, or choose an option:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Remove File", callback_data="pe:rmfile", style="danger")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="pm:cancel", style="danger")],
-        ]),
-    )
-    return PE_FILE
+    product = await _get_product(pid)
+    if not product:
+        await query.answer("❌ Product not found.", show_alert=True)
+        return ConversationHandler.END
+    draft = {
+        "category": product["category"], "name": product["name"],
+        "description": product["description"] or "", "price": product["price"],
+        "preview_file_id": product["preview_file_id"],
+        "preview_file_unique_id": product["preview_file_unique_id"],
+        "attachments": _product_attachments(product),
+        "is_active": product["is_active"], "edit_pid": pid,
+    }
+    _write_legacy_attachment_fields(draft)
+    context.user_data["pm_draft"] = draft
+    await _show_attachment_collector(query.message, draft)
+    return PR_FILE
 
 
 async def conv_pe_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6543,13 +6900,10 @@ def build_application() -> Application:
                 CallbackQueryHandler(cb_pm_cancel, pattern="^pm:cancel$"),
             ],
             PR_FILE: [
-                MessageHandler(
-                    (filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO |
-                     filters.VOICE | filters.ANIMATION) & ~filters.COMMAND,
-                    conv_pm_file,
-                ),
+                MessageHandler(filters.ALL & ~filters.COMMAND, conv_pm_attachments),
+                CallbackQueryHandler(cb_pm_att_publish, pattern=r"^pm:att:publish:(active|inactive)$"),
+                CallbackQueryHandler(cb_pm_att_clear, pattern="^pm:att:clear$"),
                 CallbackQueryHandler(cb_pm_skip_file, pattern="^pm:skip:file$"),
-                CallbackQueryHandler(cb_pm_remove_file, pattern="^pm:edit:rmfile$"),
                 CallbackQueryHandler(cb_pm_cancel, pattern="^pm:cancel$"),
             ],
             PR_STATUS: [
@@ -6580,6 +6934,12 @@ def build_application() -> Application:
             PE_PREVIEW: [
                 MessageHandler(filters.PHOTO, conv_pe_preview),
                 CallbackQueryHandler(cb_pe_remove_preview, pattern="^pe:rmpreview$"),
+                CallbackQueryHandler(cb_pm_cancel, pattern="^pm:cancel$"),
+            ],
+            PR_FILE: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, conv_pm_attachments),
+                CallbackQueryHandler(cb_pm_att_publish, pattern=r"^pm:att:publish:(active|inactive)$"),
+                CallbackQueryHandler(cb_pm_att_clear, pattern="^pm:att:clear$"),
                 CallbackQueryHandler(cb_pm_cancel, pattern="^pm:cancel$"),
             ],
             PE_FILE: [
