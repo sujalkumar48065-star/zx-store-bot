@@ -3884,7 +3884,7 @@ async def cb_pm_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     }
     await query.message.reply_text(
         f"➕ <b>Add {_category_label(category)}</b>\n\n"
-        "Step 1/6 — Enter the product <b>name</b>:\n\nSend /cancel to abort.",
+        "Step 1/5 — Enter the product <b>name</b>:\n\nSend /cancel to abort.",
         parse_mode=ParseMode.HTML,
     )
     return PR_NAME
@@ -3908,7 +3908,7 @@ async def conv_pm_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await _pm_show_review(update.message, draft)
         return PR_CONFIRM
     await update.message.reply_text(
-        "Step 2/6 — Enter the <b>description / content</b> shown to users.\n"
+        "Step 2/5 — Enter the <b>description / content</b> shown to users.\n"
         "Send - to skip.",
         parse_mode=ParseMode.HTML,
     )
@@ -3926,7 +3926,7 @@ async def conv_pm_desc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         draft.pop("edit_field", None)
         await _pm_show_review(update.message, draft)
         return PR_CONFIRM
-    await update.message.reply_text("Step 3/6 — Enter the <b>coin price</b> (0 = free):", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("Step 3/5 — Enter the <b>coin price</b> (0 = free):", parse_mode=ParseMode.HTML)
     return PR_PRICE
 
 
@@ -3945,7 +3945,7 @@ async def conv_pm_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await _pm_show_review(update.message, draft)
         return PR_CONFIRM
     await update.message.reply_text(
-        "Step 4/6 — Send an optional <b>preview image</b>, or tap Skip.",
+        "Step 4/5 — Send an optional <b>preview image</b>, or tap Skip.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⏭ Skip Image", callback_data="pm:skip:preview", style="primary")],
@@ -3992,7 +3992,7 @@ def _attachment_collector_text(draft: dict) -> str:
     if draft.get("edit_pid"):
         header = "📎 <b>Update Attachments</b>"
     else:
-        header = "Step 5/6 — <b>Send Attachments</b>"
+        header = "Step 5/5 — <b>Send Attachments</b>"
     lines = [
         header,
         "Send any type one by one: file, image, video, text, sticker, GIF, voice, poll, etc.",
