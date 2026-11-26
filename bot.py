@@ -146,12 +146,6 @@ DEFAULT_SETTINGS = {
         {"count": 25, "reward": 700},
         {"count": 50, "reward": 1500},
     ]),
-    "streak_rewards": json.dumps([
-        {"days": 3, "reward": 30},
-        {"days": 7, "reward": 80},
-        {"days": 14, "reward": 150},
-        {"days": 30, "reward": 500},
-    ]),
 }
 
 FILE_TYPE_ICON = {
@@ -1766,43 +1760,6 @@ def fmt_date(iso: str | None) -> str:
 
 
 
-async def _update_login_streak(bot, user_id: int) -> None:
-    """Increments a user's consecutive-day login streak (resets if a day was
-    missed), and grants a one-time bonus whenever a configured streak
-    milestone is newly reached. Cheap no-op on repeat calls within the same
-    day since guard_user runs on every interaction."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    async with db_conn() as db:
-        cur = await db.execute("SELECT login_streak, last_login_date FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if not row:
-            return
-        streak, last_date = row[0] or 0, row[1]
-        if last_date == today:
-            return
-
-        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-        new_streak = streak + 1 if last_date == yesterday else 1
-        await db.execute(
-            "UPDATE users SET login_streak=?, last_login_date=? WHERE user_id=?", (new_streak, today, user_id)
-        )
-        await db.commit()
-
-    rewards = json.loads(await get_setting("streak_rewards", "[]"))
-    for r in rewards:
-        if r["days"] == new_streak:
-            await add_coins(user_id, r["reward"], "login_streak", f"{new_streak}-day login streak bonus")
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"🔥 <b>{new_streak}-Day Login Streak!</b>\n\n🪙 Bonus: <b>+{r['reward']} Coins</b>\n\nKeep it going!",
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramError:
-                pass
-            break
-
-
 async def guard_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Returns True if the update should proceed normally."""
     user = update.effective_user
@@ -1810,7 +1767,6 @@ async def guard_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
 
     await ensure_user(user.id, user.username, user.first_name)
-    await _update_login_streak(context.bot, user.id)
 
     admin = await is_admin(user.id)
 
@@ -6828,7 +6784,6 @@ async def cb_mt_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 SETTINGS_FIELDS = {
     "referral_reward": "🚀 Referral Reward (coins)",
     "referral_milestones": "🚀 Referral Milestone Rewards (JSON)",
-    "streak_rewards": "🔥 Login Streak Rewards (JSON)",
     "support_username": "💬 Support Username",
     "bot_name": "🏷 Bot Name",
     "force_join": "📡 Force Join (1/0)",
