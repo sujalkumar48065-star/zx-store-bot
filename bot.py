@@ -1592,7 +1592,7 @@ def admin_reply_keyboard(is_owner: bool = True) -> ReplyKeyboardMarkup:
         "💰 Wallet Manager", "🎟 Redeem Manager",
     ]
     if is_owner:
-        buttons += ["📡 Force Channels"]
+        buttons += ["📡 Force Join"]
     buttons += ["📢 Broadcast", "👥 User Manager", "👤 All Users", "📊 Statistics", "🛠 Maintenance"]
     if is_owner:
         buttons += ["⚙ Settings"]
@@ -1622,7 +1622,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🚀 Referral Manager", callback_data="ad:referrals", style="primary")],
         [InlineKeyboardButton("💰 Wallet Manager", callback_data="ad:walletmgr", style="primary"),
          InlineKeyboardButton("🎟 Redeem Manager", callback_data="ad:redeemmgr", style="primary")],
-        [InlineKeyboardButton("📡 Force Channels", callback_data="ad:fcmgr", style="primary"),
+        [InlineKeyboardButton("📡 Force Join", callback_data="ad:fcmgr", style="primary"),
          InlineKeyboardButton("📢 Broadcast", callback_data="ad:broadcast", style="danger")],
         [InlineKeyboardButton("👥 User Manager", callback_data="ad:usermgr", style="primary"),
          InlineKeyboardButton("📊 Statistics", callback_data="ad:stats", style="primary")],
@@ -2018,6 +2018,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>Help & Guide</b>\n\n"
         "🛒 <b>Buy</b> — Browse Source Code, Method, and Product items.\n"
+        "📋 <b>/list</b> — All available products ki full list dekho.\n"
         "🪙 <b>Coins</b> — Wallet me balance dekho, Invite se coins kamao, "
         "ya Redeem Code se code redeem karo.\n"
         "👥 <b>Invite</b> — Apna invite link share karo aur coins kamao.\n"
@@ -2025,6 +2026,55 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "💬 <b>Support</b> — Reach out any time via the Support menu.\n"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_product_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard_user(update, context):
+        return
+    async with db_conn() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT category, name FROM products "
+            "WHERE is_deleted=0 AND is_active=1 ORDER BY product_id DESC"
+        )
+        rows = await cur.fetchall()
+    grouped = {category: [] for category in PRODUCT_CATEGORIES}
+    for row in rows:
+        category = row["category"]
+        if category in grouped:
+            grouped[category].append(row["name"])
+    lines = [
+        "📋 <b>ZX STORE — PRODUCT LIST</b>",
+        DIVIDER,
+        "",
+    ]
+    headings = [
+        ("bot", "💻 <b>SOURCE CODE</b>"),
+        ("method", "📘 <b>METHOD</b>"),
+        ("product", "📦 <b>PRODUCT</b>"),
+    ]
+    for category, heading in headings:
+        names = grouped.get(category, [])
+        lines.append(f"{heading} ({len(names)})")
+        if names:
+            lines.extend(f"• {html.escape(name)}" for name in names)
+        else:
+            lines.append("• <i>No items</i>")
+        lines.append("")
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in lines:
+        added = len(line) + 1
+        if current and size + added > 3900:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += added
+    if current:
+        chunks.append("\n".join(current))
+    for chunk in chunks:
+        await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
 async def handle_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5443,17 +5493,72 @@ async def cb_mf_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cb_admin_fcmgr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_owner(update):
         return
+    enabled = (await get_setting("force_join", "1")) == "1"
+    channels = await list_force_channels()
+    text = (
+        "📡 <b>Force Join Manager</b>\n"
+        f"{DIVIDER}\n"
+        f"Status: {'✅ Enabled' if enabled else '⛔ Disabled'}\n"
+        f"Channels: <b>{len(channels)}</b>\n\n"
+        "Users cannot use the bot until they join all channels."
+    )
+    toggle_text = "⛔ Disable Force Join" if enabled else "✅ Enable Force Join"
+    toggle_style = "danger" if enabled else "success"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Channel", callback_data="fc:add", style="success"),
          InlineKeyboardButton("➖ Remove Channel", callback_data="fc:remove", style="danger")],
-        [InlineKeyboardButton("📋 Channel List", callback_data="fc:list", style="primary")],
+        [InlineKeyboardButton("📋 Channel List", callback_data="fc:list", style="primary"),
+         InlineKeyboardButton("🧪 Test All", callback_data="fc:test", style="primary")],
+        [InlineKeyboardButton(toggle_text, callback_data="fc:toggle", style=toggle_style)],
         [InlineKeyboardButton("⬅ Back", callback_data="ad:home", style="primary")],
     ])
     if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text("📡 <b>Force Channel Manager</b>", parse_mode=ParseMode.HTML, reply_markup=kb)
+        try:
+            await update.callback_query.answer()
+        except TelegramError:
+            pass
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
-        await update.effective_message.reply_text("📡 <b>Force Channel Manager</b>", parse_mode=ParseMode.HTML, reply_markup=kb)
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def cb_fc_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+    query = update.callback_query
+    enabled = (await get_setting("force_join", "1")) == "1"
+    await set_setting("force_join", "0" if enabled else "1")
+    _force_join_cache.clear()
+    await query.answer("⛔ Disabled" if enabled else "✅ Enabled")
+    await cb_admin_fcmgr(update, context)
+
+
+async def cb_fc_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    channels = await list_force_channels()
+    if not channels:
+        await query.edit_message_text(
+            "🧪 <b>Force Join Test</b>\n\nNo channels added yet.",
+            parse_mode=ParseMode.HTML, reply_markup=back_button("ad:fcmgr"),
+        )
+        return
+    me = await context.bot.get_me()
+    lines = ["🧪 <b>Force Join Test</b>\n"]
+    for ch in channels:
+        try:
+            await context.bot.get_chat(int(ch["chat_id"]))
+            member = await context.bot.get_chat_member(int(ch["chat_id"]), me.id)
+            status = _enum_text(member.status)
+            ok = status not in ("left", "kicked")
+            lines.append(f"{'✅' if ok else '❌'} <b>{html.escape(ch['title'] or str(ch['chat_id']))}</b> — bot: {html.escape(status)}")
+        except TelegramError as exc:
+            lines.append(f"❌ <b>{html.escape(ch['title'] or str(ch['chat_id']))}</b> — {html.escape(str(exc))}")
+    await query.edit_message_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=back_button("ad:fcmgr")
+    )
 
 
 async def cb_fc_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5462,118 +5567,242 @@ async def cb_fc_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
     await query.message.reply_text(
-        "➕ <b>Add Force-Join Channel/Group</b>\n\n"
-        "Send either:\n"
-        "• A public <b>@username</b>\n"
-        "• Or a <b>https://t.me/username</b> link\n\n"
-        "I need to already be a <b>member</b> of it — admin rights aren't required.",
+        "➕ <b>Add Force-Join Channel</b>\n\n"
+        "Send one of these:\n"
+        "• Public channel/group <b>@username</b>\n"
+        "• Public link <b>https://t.me/username</b>\n"
+        "• Private channel: <b>forward any message from that channel</b>\n"
+        "• Or send its numeric ID <code>-100...</code>\n\n"
+        "Bot must already be a member. For private channels, make the bot admin with Invite Users permission.",
         parse_mode=ParseMode.HTML,
     )
     return FC_ADD
 
 
+def _parse_force_chat_text(text: str) -> tuple[str | None, int | None]:
+    text = (text or "").strip()
+    if re.match(r"^-100\d{6,}$", text):
+        return None, int(text)
+    if text.startswith("@") and re.match(r"^@[A-Za-z0-9_]{5,32}$", text):
+        return text, None
+    match = re.match(r"^https?://t\.me/([A-Za-z0-9_]{5,32})/?$", text)
+    if match:
+        return f"@{match.group(1)}", None
+    return "", None
+
+
 async def conv_fc_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = update.message
     try:
-        text = (msg.text or "").strip()
-        username = None
-
-        if text.startswith("@") and re.match(r"^@[A-Za-z0-9_]{5,32}$", text):
-            username = text
+        chat = None
+        if msg.forward_from_chat:
+            chat = await context.bot.get_chat(msg.forward_from_chat.id)
         else:
-            m = re.match(r"^https?://t\.me/([A-Za-z0-9_]{5,32})/?$", text)
-            if m:
-                username = f"@{m.group(1)}"
-
-        if not username:
-            await msg.reply_text("❌ Please send a valid @username or a https://t.me/username link.")
-            return FC_ADD
-
-        try:
-            chat = await context.bot.get_chat(username)
-        except TelegramError as e:
-            await msg.reply_text(
-                f"❌ Couldn't find that channel/group ({html.escape(str(e))}).\n"
-                "Make sure the username is correct and I've already been added to it.",
-                parse_mode=ParseMode.HTML,
-            )
-            return FC_ADD
-
-        try:
-            me = await context.bot.get_me()
-            member = await context.bot.get_chat_member(chat.id, me.id)
-            if member.status in ("left", "kicked"):
-                await msg.reply_text("❌ I'm not currently a member of that chat. Please add me first, then try again.")
+            text = (msg.text or "").strip()
+            if "t.me/+" in text or "t.me/joinchat/" in text:
+                await msg.reply_text(
+                    "❌ Private invite links cannot be verified directly.\n"
+                    "Forward any message from that private channel instead, or add it by numeric ID.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return FC_ADD
-        except TelegramError as e:
+            username, chat_id = _parse_force_chat_text(text)
+            if not username and chat_id is None:
+                await msg.reply_text(
+                    "❌ Send a valid @username, public t.me link, forwarded channel message, or -100... ID."
+                )
+                return FC_ADD
+            try:
+                chat = await context.bot.get_chat(chat_id if chat_id is not None else username)
+            except TelegramError as exc:
+                await msg.reply_text(
+                    f"❌ Couldn't find that channel/group ({html.escape(str(exc))}).\n"
+                    "Make sure the username/ID is correct and I'm already added.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return FC_ADD
+
+        me = await context.bot.get_me()
+        try:
+            member = await context.bot.get_chat_member(chat.id, me.id)
+        except TelegramError as exc:
             await msg.reply_text(
-                f"❌ I can't access that chat's member list ({html.escape(str(e))}).\n"
-                "Please make sure I've been added to it.",
+                f"❌ I can't access that chat's member list ({html.escape(str(exc))}).\n"
+                "Add me to the channel first, then try again.",
                 parse_mode=ParseMode.HTML,
             )
             return FC_ADD
+        if _enum_text(member.status) in ("left", "kicked"):
+            await msg.reply_text("❌ I'm not a member of that chat. Add me first, then try again.")
+            return FC_ADD
 
-        resolved_username = f"@{chat.username}" if chat.username else username
-        await _save_force_channel(chat.id, resolved_username, chat.title, str(chat.type))
-        await msg.reply_text(f"✅ Added: <b>{html.escape(chat.title)}</b>", parse_mode=ParseMode.HTML)
+        chat_type = _enum_text(getattr(chat, "type", "channel"))
+        username = f"@{chat.username}" if getattr(chat, "username", None) else None
+        invite_link = None
+        if username is None:
+            invite_link = getattr(chat, "invite_link", None)
+            if not invite_link:
+                try:
+                    invite_link = await context.bot.export_chat_invite_link(chat.id)
+                except TelegramError as exc:
+                    await msg.reply_text(
+                        "❌ Private channel ka invite link nahi ban paya.\n"
+                        "Bot ko channel admin banao with <b>Invite Users</b> permission, "
+                        "then try again.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return FC_ADD
+
+        await _save_force_channel(
+            chat.id, username, chat.title or str(chat.id), chat_type, invite_link
+        )
+        _force_join_cache.clear()
+        await msg.reply_text(
+            f"✅ Added: <b>{html.escape(chat.title or str(chat.id))}</b>\n"
+            f"Type: <b>{html.escape(chat_type)}</b>\n"
+            f"Join {'link' if invite_link else 'username'}: "
+            f"<code>{html.escape(username or invite_link or '')}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return ConversationHandler.END
 
-    except Exception as e:
+    except Exception as exc:
         log.exception("Unexpected error in conv_fc_add")
         await msg.reply_text(
-            f"⚠️ <b>Something went wrong adding this channel.</b>\n<code>{html.escape(str(e))}</code>\n\n"
-            "This has been logged — please share this exact message so it can be fixed.",
+            f"⚠️ <b>Something went wrong adding this channel.</b>\n<code>{html.escape(str(exc))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return ConversationHandler.END
 
 
-async def _save_force_channel(chat_id: int, username: str, title: str, chat_type: str) -> None:
+async def _save_force_channel(
+    chat_id: int, username: str | None, title: str, chat_type: str,
+    invite_link: str | None = None,
+) -> None:
     async with db_conn() as db:
-        await db.execute(
-            "INSERT INTO force_channels (username, chat_id, title, chat_type, added_date) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
-            "chat_id=excluded.chat_id, title=excluded.title, chat_type=excluded.chat_type",
-            (username, chat_id, title, chat_type, datetime.utcnow().isoformat()),
-        )
+        row = None
+        if username:
+            cur = await db.execute(
+                "SELECT id FROM force_channels WHERE username=? OR chat_id=?",
+                (username, chat_id),
+            )
+            row = await cur.fetchone()
+        else:
+            cur = await db.execute(
+                "SELECT id FROM force_channels WHERE chat_id=?", (chat_id,)
+            )
+            row = await cur.fetchone()
+        if row:
+            await db.execute(
+                "UPDATE force_channels SET username=?, chat_id=?, title=?, chat_type=?, "
+                "invite_link=?, added_date=? WHERE id=?",
+                (
+                    username, chat_id, title, chat_type, invite_link,
+                    datetime.utcnow().isoformat(), row[0],
+                ),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO force_channels (username, chat_id, title, chat_type, invite_link, added_date) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    username, chat_id, title, chat_type, invite_link,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
         await db.commit()
 
 
 async def cb_fc_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
     query = update.callback_query
     await query.answer()
     channels = await list_force_channels()
+    enabled = (await get_setting("force_join", "1")) == "1"
     if not channels:
-        text = "📋 <b>Channel List</b>\n\nNo channels added yet."
+        text = "📋 <b>Force Join Channels</b>\n\nNo channels added yet."
     else:
-        lines = ["📋 <b>Channel List</b>\n"]
-        for ch in channels:
-            lines.append(f"• <b>{html.escape(ch['title'])}</b> — added {fmt_date(ch['added_date'])}")
+        lines = [
+            "📋 <b>Force Join Channels</b>\n",
+            f"Status: {'✅ Enabled' if enabled else '⛔ Disabled'} | Total: <b>{len(channels)}</b>\n",
+        ]
+        for index, ch in enumerate(channels, start=1):
+            link = ch["username"] or ch["invite_link"] or "—"
+            lines.append(
+                f"{index}. <b>{html.escape(ch['title'] or str(ch['chat_id']))}</b>\n"
+                f"   Type: {html.escape(ch['chat_type'] or 'channel')} | Added: {fmt_date(ch['added_date'])}\n"
+                f"   Link: <code>{html.escape(link)}</code>"
+            )
         text = "\n".join(lines)
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_button("ad:fcmgr"))
 
 
 async def cb_fc_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
     channels = await list_force_channels()
     if not channels:
         await query.edit_message_text("No channels to remove.", reply_markup=back_button("ad:fcmgr"))
         return
-    buttons = [[InlineKeyboardButton(f"➖ {ch['title']}", callback_data=f"fc:rm:{ch['id']}", style="danger")] for ch in channels]
+    buttons = [
+        [InlineKeyboardButton(
+            f"➖ {ch['title'] or ch['chat_id']}",
+            callback_data=f"fc:rm:{ch['id']}", style="danger",
+        )]
+        for ch in channels
+    ]
     buttons.append([InlineKeyboardButton("⬅ Back", callback_data="ad:fcmgr", style="primary")])
-    await query.edit_message_text("➖ Select a channel to remove:", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(
+        "➖ <b>Remove Force-Join Channel</b>\n\nSelect a channel:",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_fc_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    ch_id = int(query.data.split(":")[2])
+    async with db_conn() as db:
+        cur = await db.execute("SELECT * FROM force_channels WHERE id=?", (ch_id,))
+        ch = await cur.fetchone()
+    if not ch:
+        await query.edit_message_text("❌ Channel not found.", reply_markup=back_button("fc:remove"))
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"fc:rmok:{ch_id}", style="danger"),
+         InlineKeyboardButton("❌ No", callback_data="fc:remove", style="primary")],
+    ])
+    await query.edit_message_text(
+        f"⚠️ <b>Remove this channel?</b>\n\n"
+        f"📢 {html.escape(ch['title'] or str(ch['chat_id']))}\n"
+        f"Type: {html.escape(ch['chat_type'] or 'channel')}\n\n"
+        "Users will no longer need to join it.",
+        parse_mode=ParseMode.HTML, reply_markup=kb,
+    )
 
 
 async def cb_fc_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
     query = update.callback_query
     ch_id = int(query.data.split(":")[2])
     async with db_conn() as db:
         await db.execute("DELETE FROM force_channels WHERE id=?", (ch_id,))
         await db.commit()
-    await query.answer("➖ Removed")
+    _force_join_cache.clear()
+    try:
+        await query.answer("➖ Removed")
+    except TelegramError:
+        pass
     await cb_fc_remove_menu(update, context)
-
 
 
 async def cb_admin_walletmgr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6720,6 +6949,7 @@ TEXT_ROUTES = {
     "💰 Wallet Manager": cb_admin_walletmgr,
     "🎟 Redeem Manager": cb_admin_redeemmgr,
     "📡 Force Channels": cb_admin_fcmgr,
+    "📡 Force Join": cb_admin_fcmgr,
     "👤 All Users": cb_admin_all_users,
     "🛡 Admin Manager": cb_admin_adminmgr,
     "📋 Admin List": cb_admin_adminmgr,
@@ -6767,6 +6997,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("list", cmd_product_list))
 
     app.add_handler(CallbackQueryHandler(cb_verify_join, pattern="^verify_join$"))
 
@@ -7014,7 +7245,10 @@ def build_application() -> Application:
     app.add_handler(fc_add_conv)
     app.add_handler(CallbackQueryHandler(cb_fc_list, pattern="^fc:list$"))
     app.add_handler(CallbackQueryHandler(cb_fc_remove_menu, pattern="^fc:remove$"))
-    app.add_handler(CallbackQueryHandler(cb_fc_remove_confirm, pattern=r"^fc:rm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_fc_remove_prompt, pattern=r"^fc:rm:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_fc_remove_confirm, pattern=r"^fc:rmok:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_fc_toggle, pattern="^fc:toggle$"))
+    app.add_handler(CallbackQueryHandler(cb_fc_test, pattern="^fc:test$"))
 
     wm_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_wm_action_start, pattern="^wm:(add|remove|reset|setbal)$")],
