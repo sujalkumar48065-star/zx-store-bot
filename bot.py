@@ -1344,6 +1344,15 @@ async def _apply_admin_overrides() -> None:
         for admin_id in REMOVE_ADMIN_IDS:
             if admin_id != OWNER_ID:
                 await db.execute("DELETE FROM admins WHERE user_id=?", (admin_id,))
+        cur = await db.execute(
+            "SELECT 1 FROM settings WHERE key='force_join_emergency_off_v1'"
+        )
+        if not await cur.fetchone():
+            await db.execute("UPDATE settings SET value='0' WHERE key='force_join'")
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES "
+                "('force_join_emergency_off_v1', '1')"
+            )
         await db.commit()
 
 
@@ -5551,8 +5560,12 @@ async def conv_fc_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     msg = update.message
     try:
         chat = None
-        if msg.forward_from_chat:
-            chat = await context.bot.get_chat(msg.forward_from_chat.id)
+        origin = getattr(msg, "forward_origin", None)
+        forwarded_chat = getattr(origin, "chat", None) if origin is not None else None
+        if forwarded_chat is None:
+            forwarded_chat = getattr(msg, "forward_from_chat", None)
+        if forwarded_chat is not None:
+            chat = await context.bot.get_chat(forwarded_chat.id)
         else:
             text = (msg.text or "").strip()
             if "t.me/+" in text or "t.me/joinchat/" in text:
